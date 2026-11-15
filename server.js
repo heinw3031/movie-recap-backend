@@ -28,6 +28,18 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 500);
 const VALID_LENGTHS = [5, 10, 15, 30];
 
 const app = express();
+// CORS: the JSON API (approve script, generate) is called cross-origin from
+// the test helper page and the user's tools. No cookies/credentials are
+// involved — the API key never leaves the server — so allow any origin.
+// Without this, browsers block POST /api/jobs/:id/script and /generate
+// (preflight fails) and only curl/console could approve a script.
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 
 const upload = multer({

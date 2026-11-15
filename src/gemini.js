@@ -7,7 +7,7 @@
  *   so a generic name like "movie.mp4" made Gemini invent the story.
  * What this module does instead:
  *   analyseVideo() extracts REAL frames from the uploaded video (1 frame / 30s)
- *   and sends those frames to Gemini 2.5 Flash, so the summary comes from
+ *   and sends those frames to Gemini 3.8 Flash, so the summary comes from
  *   what is actually on screen. The filename is passed only as a label.
  *
  * generateSceneAudio() calls Gemini TTS for real. If there is no API key,
@@ -22,8 +22,13 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 
-const ANALYSIS_MODEL = 'gemini-2.5-flash';
-const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+// 2026-11-15: gemini-2.5-flash returns 404 "no longer available to new
+// users" for this API key, and gemini-2.5-flash-preview-tts is the same
+// generation — both replaced with the 3.8 generation (verified live in
+// GET /v1beta/models on 2026-11-15: gemini-3.8-flash and
+// gemini-3.8-flash-tts both exist). Override via env if Gemini retires them.
+const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gemini-3.8-flash';
+const TTS_MODEL = process.env.TTS_MODEL || 'gemini-3.8-flash-tts';
 // Burmese TTS voice. 'Kore' is a documented prebuilt voice for the TTS model;
 // change via TTS_VOICE env if Gemini adds a my-MM-specific voice.
 const DEFAULT_TTS_VOICE = process.env.TTS_VOICE || 'Kore';
@@ -97,7 +102,7 @@ async function extractFrames(videoPath, outDir, intervalSec = 30) {
 }
 
 /**
- * Analyse the video for real: send extracted frames to Gemini 2.5 Flash.
+ * Analyse the video for real: send extracted frames to Gemini 3.8 Flash.
  * Returns [{ startSec, endSec, description }] covering the video.
  * Never invents a story from the filename alone — if no frames could be
  * extracted, it throws instead of guessing.

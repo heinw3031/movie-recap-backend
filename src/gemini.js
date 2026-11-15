@@ -421,10 +421,22 @@ async function generateAllSceneAudio(scenes, audioDir, voiceName = DEFAULT_TTS_V
 }
 
 /**
- * Split one MP3 into N segments at its longest silences.
+ * Split one MP3 into N segments at the silences between scenes.
  * Returns [{ path, durationSec }] or null when the split is not trustworthy
  * (too few silences, or a segment shorter than 0.5s) — the caller then
  * falls back to per-scene TTS instead of shipping a bad split.
+ *
+ * Why the first version failed on real audio (job 55046916, 2026-11-15):
+ * it required silences of >=1.0s and picked the N-1 LONGEST ones. The
+ * <long pause> tag's real duration is model-controlled and unproven — if it
+ * renders as ~0.5s, nothing is detected and the split returns null.
+ * This version (a) detects shorter pauses (d=0.5), and (b) anchors each
+ * boundary to where it SHOULD be: scene audio length is roughly
+ * proportional to narration length (~20 Burmese chars per second, scaled
+ * to the real total), so for each expected boundary it takes the NEAREST
+ * detected silence within tolerance. A long pause inside a scene can no
+ * longer be mistaken for a scene boundary, and every decision is logged
+ * so the next failure is diagnosable from the Railway logs.
  */
 async function splitAudioBySilence(wholeMp3, scenes, workDir) {
   const sceneCount = scenes.length;
@@ -434,7 +446,7 @@ async function splitAudioBySilence(wholeMp3, scenes, workDir) {
   try {
     const res = await execFileAsync('ffmpeg', [
       '-i', wholeMp3,
-      '-af', 'silencedetect=noise=-30dB:d=1.0',
+      '-af', 'silencedetect=noise=-35dB:d=0.5',
       '-f', 'null', '-',
     ]);
     stderr = res.stderr || '';
@@ -455,17 +467,53 @@ async function splitAudioBySilence(wholeMp3, scenes, workDir) {
       pendingStart = null;
     }
   }
+  console.log(
+    `[gemini] silencedetect: ${silences.length} silences >=0.5s in ${totalSec.toFixed(1)}s audio: ` +
+      silences.map((s) => `${s.start.toFixed(1)}-${s.end.toFixed(1)}s`).join(', ')
+  );
   const needed = sceneCount - 1;
-  if (silences.length < needed) return null;
-  // Take the N-1 LONGEST silences as the scene boundaries (natural
-  // sentence pauses inside a scene are ~0.2-0.5s; the inserted
-  // <long pause> between scenes is ~1.2s+, so the longest ones win).
-  const boundaries = silences
-    .slice()
-    .sort((a, b) => b.duration - a.duration)
-    .slice(0, needed)
-    .sort((a, b) => a.start - b.start)
-    .map((s) => (s.start + s.end) / 2);
+  if (silences.length < needed) {
+    console.log(`[gemini] split failed: need ${needed} boundaries, found ${silences.length} silences`);
+    return null;
+  }
+  // Expected boundary times from narration lengths, scaled to the real total.
+  const est = scenes.map((s) => Math.max(3, (s.narrationMy || '').length / 20));
+  const estTotal = est.reduce((a, b) => a + b, 0);
+  const scale = totalSec / estTotal;
+  const expected = [];
+  let cum = 0;
+  for (let i = 0; i < sceneCount - 1; i++) {
+    cum += est[i] * scale;
+    expected.push(cum);
+  }
+  const used = new Set();
+  const boundaries = [];
+  for (const exp of expected) {
+    let best = null;
+    let bestDist = Infinity;
+    for (let i = 0; i < silences.length; i++) {
+      if (used.has(i)) continue;
+      const mid = (silences[i].start + silences[i].end) / 2;
+      const dist = Math.abs(mid - exp);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+    const tolerance = Math.max(3, 0.2 * totalSec);
+    if (best === null || bestDist > tolerance) {
+      console.log(
+        `[gemini] split failed: no silence near expected boundary ${exp.toFixed(1)}s (nearest ${bestDist.toFixed(1)}s away, tolerance ${tolerance.toFixed(1)}s)`
+      );
+      return null;
+    }
+    used.add(best);
+    boundaries.push((silences[best].start + silences[best].end) / 2);
+  }
+  boundaries.sort((a, b) => a - b);
+  console.log(
+    `[gemini] split boundaries: expected [${expected.map((x) => x.toFixed(1)).join(', ')}] -> chosen [${boundaries.map((x) => x.toFixed(1)).join(', ')}]`
+  );
   const cuts = [0, ...boundaries, totalSec];
   const segments = [];
   for (let i = 0; i < sceneCount; i++) {
@@ -477,7 +525,10 @@ async function splitAudioBySilence(wholeMp3, scenes, workDir) {
       '-i', wholeMp3, '-c', 'copy', out,
     ]);
     const durationSec = await ffprobeDuration(out);
-    if (!durationSec || durationSec < 0.5) return null;
+    if (!durationSec || durationSec < 0.5) {
+      console.log(`[gemini] split failed: segment ${i + 1} duration ${durationSec} too short`);
+      return null;
+    }
     segments.push({ path: out, durationSec });
   }
   return segments;

@@ -77,22 +77,42 @@ async function runGenerate(jobId) {
   fs.mkdirSync(audioDir, { recursive: true });
 
   try {
-    // --- TTS, one real call per scene ---
+    // --- TTS ---
+    // Default: ONE Gemini call for the whole recap (batched), split back
+    // into per-scene clips — the free tier counts REQUESTS (10/day/model),
+    // not minutes, so a 5-min recap costs 1 request instead of 7.
+    // TTS_BATCH=0 restores the old one-call-per-scene path.
     const total = job.scenes.length;
-    const scenesWithAudio = [];
-    for (let i = 0; i < total; i++) {
-      const scene = job.scenes[i];
-      const progress = 40 + Math.round(((i) / total) * 30); // 40-70%
-      setStage(jobId, 'tts', progress);
-      const outMp3 = path.join(audioDir, `scene-${String(i + 1).padStart(2, '0')}.mp3`);
-      // Throws if no API key / no audio — job fails honestly, never fakes it.
-      const { durationSec } = await gemini.generateSceneAudio(scene.narrationMy, outMp3);
-      scenesWithAudio.push({ ...scene, audioPath: outMp3, audioDurationSec: durationSec });
+    let scenesWithAudio;
+    if (process.env.TTS_BATCH === '0') {
+      scenesWithAudio = [];
+      for (let i = 0; i < total; i++) {
+        const scene = job.scenes[i];
+        const progress = 40 + Math.round((i / total) * 30); // 40-70%
+        setStage(jobId, 'tts', progress);
+        const outMp3 = path.join(audioDir, `scene-${String(i + 1).padStart(2, '0')}.mp3`);
+        // Throws if no API key / no audio — job fails honestly, never fakes it.
+        const { durationSec } = await gemini.generateSceneAudio(scene.narrationMy, outMp3);
+        scenesWithAudio.push({ ...scene, audioPath: outMp3, audioDurationSec: durationSec });
+        store.updateJob(jobId, {
+          scenes: scenesWithAudio.concat(job.scenes.slice(i + 1)),
+          audioDurations: { ...job.audioDurations, [scene.sceneNumber]: durationSec },
+        });
+        console.log(`[job ${jobId}] TTS scene ${i + 1}/${total}: ${durationSec.toFixed(1)}s`);
+      }
+    } else {
+      setStage(jobId, 'tts', 45);
+      scenesWithAudio = await gemini.generateRecapAudio(job.scenes, audioDir);
       store.updateJob(jobId, {
-        scenes: scenesWithAudio.concat(job.scenes.slice(i + 1)),
-        audioDurations: { ...job.audioDurations, [scene.sceneNumber]: durationSec },
+        scenes: scenesWithAudio,
+        audioDurations: Object.fromEntries(
+          scenesWithAudio.map((s) => [s.sceneNumber, s.audioDurationSec])
+        ),
       });
-      console.log(`[job ${jobId}] TTS scene ${i + 1}/${total}: ${durationSec.toFixed(1)}s`);
+      scenesWithAudio.forEach((s, i) =>
+        console.log(`[job ${jobId}] TTS scene ${i + 1}/${total}: ${s.audioDurationSec.toFixed(1)}s`)
+      );
+      setStage(jobId, 'tts', 70);
     }
 
     // --- Render ---

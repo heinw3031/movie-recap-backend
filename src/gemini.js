@@ -38,7 +38,15 @@ function retryDelayFromError(err) {
   return null;
 }
 
+function isDailyQuotaError(err) {
+  const msg = String((err && err.message) || '');
+  return /per day|daily|GenerateRequestsPerDay/i.test(msg);
+}
+
 function isRetryableError(err) {
+  // A daily-quota 429 is NOT retryable: no wait fixes it until tomorrow's
+  // reset, so retrying would only burn minutes and hide the real cause.
+  if (isDailyQuotaError(err)) return false;
   const msg = String((err && err.message) || '');
   return (
     /429|503|UNAVAILABLE|RESOURCE_EXHAUSTED|fetch failed|ECONNRESET|ETIMEDOUT/i.test(msg)
@@ -78,8 +86,28 @@ async function throttleTts() {
 // generation — both replaced with the 3.8 generation (verified live in
 // GET /v1beta/models on 2026-11-15: gemini-3.8-flash and
 // gemini-3.8-flash-tts both exist). Override via env if Gemini retires them.
+// 2026-11-15: the free-tier DAILY TTS quota is 10 requests/day PER MODEL
+// (verified: job bd6b52c2 died at scene 7 with "GenerateRequestsPerDayPerModel-FreeTier").
+// One 5-min recap needs 7 per-scene calls, so the old path allowed ~1 recap/day.
+// Two fixes live here: (a) rotate across both surviving 3.8 TTS models
+// (flash-tts + flash-lite-tts, same schema and voices), and (b) batch a whole
+// recap into ONE call (see generateRecapAudio) — one call returns ~11 min of
+// audio, so a 5-min recap costs 1 request instead of 7.
+// SCRIPT_MODEL: the script call is text-only. gemini-3.8-flash text is 20 RPD,
+// which caps recaps at 10/day even with TTS fixed; gemini-3.5-flash-lite is
+// 500 RPD. Default stays on the proven 3.8-flash until lite script quality
+// is tested — switch with SCRIPT_MODEL=gemini-3.5-flash-lite.
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gemini-3.8-flash';
-const TTS_MODEL = process.env.TTS_MODEL || 'gemini-3.8-flash-tts';
+const SCRIPT_MODEL = process.env.SCRIPT_MODEL || ANALYSIS_MODEL;
+const TTS_MODELS = (process.env.TTS_MODELS || process.env.TTS_MODEL || 'gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const TTS_MODEL = TTS_MODELS[0];
+// Models whose DAILY quota is exhausted (reset at midnight Pacific).
+// A daily-quota 429 is never retried — waiting cannot fix it — the call
+// fails over to the next model immediately instead.
+const exhaustedTtsModels = new Set();
 // Burmese TTS voice. 'Kore' is a documented prebuilt voice for the TTS model;
 // change via TTS_VOICE env if Gemini adds a my-MM-specific voice.
 const DEFAULT_TTS_VOICE = process.env.TTS_VOICE || 'Kore';
@@ -242,7 +270,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   const response = await withRetry(
     () =>
       ai.models.generateContent({
-        model: ANALYSIS_MODEL,
+        model: SCRIPT_MODEL,
         contents: prompt,
         config: { responseMimeType: 'application/json' },
       }),
@@ -291,55 +319,244 @@ function writePcmAsWav(pcmBuffer, outPath) {
 }
 
 /**
+ * Write audio bytes to a WAV file. gemini-3.8 TTS returns a complete RIFF
+ * WAV over generateContent; older models returned headerless PCM. Writing a
+ * second header on top of a complete WAV corrupts it silently — detect it
+ * and write the bytes as-is.
+ */
+function audioBufferToWav(buffer, outPath) {
+  if (buffer.length >= 4 && buffer.toString('ascii', 0, 4) === 'RIFF') {
+    fs.writeFileSync(outPath, buffer);
+    return;
+  }
+  writePcmAsWav(buffer, outPath);
+}
+
+/**
+ * One Gemini TTS call, rotating across TTS_MODELS. A model whose DAILY
+ * quota is exhausted is skipped for the rest of the process (a daily 429
+ * is never retried — waiting cannot fix it until tomorrow's reset).
+ * Returns the raw audio bytes. Throws when every model is exhausted or
+ * the call fails after retries.
+ */
+async function generateTtsAudioBuffer(text, voiceName, what) {
+  const ai = getClient();
+  let lastErr;
+  for (const model of TTS_MODELS) {
+    if (exhaustedTtsModels.has(model)) continue;
+    await throttleTts();
+    try {
+      const response = await withRetry(
+        () =>
+          ai.models.generateContent({
+            model,
+            contents: [{ parts: [{ text }] }],
+            config: {
+              responseModalities: ['AUDIO'],
+              speechConfig: {
+                voiceConfig: { prebuiltVoiceConfig: { voiceName } },
+              },
+            },
+          }),
+        `${what} (${model})`
+      );
+      const parts =
+        (response.candidates &&
+          response.candidates[0] &&
+          response.candidates[0].content &&
+          response.candidates[0].content.parts) ||
+        [];
+      const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
+      if (!audioPart) {
+        throw new Error(
+          'Gemini TTS returned no audio. Check your GEMINI_API_KEY, ' +
+            'the TTS model quota, and that the text is not empty. The job is marked failed — audio is never faked.'
+        );
+      }
+      const buffer = Buffer.from(audioPart.inlineData.data, 'base64');
+      if (buffer.length === 0) throw new Error('Gemini TTS returned empty audio data.');
+      return buffer;
+    } catch (err) {
+      lastErr = err;
+      if (isDailyQuotaError(err)) {
+        exhaustedTtsModels.add(model);
+        console.log(`[gemini] ${model} daily TTS quota exhausted — failing over to the next model.`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new Error('Gemini TTS failed on every model (daily quota exhausted for the day).');
+}
+
+/**
  * Generate REAL Burmese speech for one scene with Gemini TTS.
  * Returns { path (MP3), durationSec }.
  * Throws a clear error when there is no API key or no audio is returned —
  * it never pretends to have generated audio.
  */
 async function generateSceneAudio(textMy, outMp3Path, voiceName = DEFAULT_TTS_VOICE) {
-  const ai = getClient();
   if (!textMy || !textMy.trim()) throw new Error('generateSceneAudio: empty narration text.');
-  await throttleTts();
-  const response = await withRetry(
-    () =>
-      ai.models.generateContent({
-        model: TTS_MODEL,
-        contents: [{ parts: [{ text: textMy }] }],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
-          },
-        },
-      }),
-    'scene TTS'
-  );
-  const parts = (response.candidates && response.candidates[0] && response.candidates[0].content && response.candidates[0].content.parts) || [];
-  const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
-  if (!audioPart) {
-    throw new Error(
-      'Gemini TTS returned no audio for this scene. Check your GEMINI_API_KEY, ' +
-        'the TTS model quota, and that the text is not empty. The job is marked failed — audio is never faked.'
-    );
-  }
-  const pcm = Buffer.from(audioPart.inlineData.data, 'base64');
-  if (pcm.length === 0) throw new Error('Gemini TTS returned empty audio data.');
+  const buffer = await generateTtsAudioBuffer(textMy, voiceName, 'scene TTS');
   const wavPath = outMp3Path.replace(/\.mp3$/i, '.wav');
-  writePcmAsWav(pcm, wavPath);
+  audioBufferToWav(buffer, wavPath);
   await execFileAsync('ffmpeg', ['-y', '-i', wavPath, '-codec:a', 'libmp3lame', '-q:a', '4', outMp3Path]);
   fs.unlinkSync(wavPath);
   const durationSec = await ffprobeDuration(outMp3Path);
   return { path: outMp3Path, durationSec };
 }
 
+/** Per-scene TTS for a list of scenes. Returns scenes with audioPath + audioDurationSec. */
+async function generateAllSceneAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOICE) {
+  fs.mkdirSync(audioDir, { recursive: true });
+  const out = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+    const num = scene.sceneNumber || i + 1;
+    const mp3 = path.join(audioDir, `scene_${num}.mp3`);
+    const { durationSec } = await generateSceneAudio(scene.narrationMy, mp3, voiceName);
+    out.push({ ...scene, audioPath: mp3, audioDurationSec: durationSec });
+  }
+  return out;
+}
+
+/**
+ * Split one MP3 into N segments at its longest silences.
+ * Returns [{ path, durationSec }] or null when the split is not trustworthy
+ * (too few silences, or a segment shorter than 0.5s) — the caller then
+ * falls back to per-scene TTS instead of shipping a bad split.
+ */
+async function splitAudioBySilence(wholeMp3, scenes, workDir) {
+  const sceneCount = scenes.length;
+  const totalSec = await ffprobeDuration(wholeMp3);
+  if (!totalSec || totalSec <= 0) return null;
+  let stderr = '';
+  try {
+    const res = await execFileAsync('ffmpeg', [
+      '-i', wholeMp3,
+      '-af', 'silencedetect=noise=-30dB:d=1.0',
+      '-f', 'null', '-',
+    ]);
+    stderr = res.stderr || '';
+  } catch (e) {
+    stderr = (e && e.stderr) || '';
+  }
+  const silences = [];
+  let pendingStart = null;
+  for (const line of stderr.split('\n')) {
+    const s = line.match(/silence_start:\s*([\d.]+)/);
+    if (s) {
+      pendingStart = parseFloat(s[1]);
+      continue;
+    }
+    const e = line.match(/silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)/);
+    if (e && pendingStart !== null) {
+      silences.push({ start: pendingStart, end: parseFloat(e[1]), duration: parseFloat(e[2]) });
+      pendingStart = null;
+    }
+  }
+  const needed = sceneCount - 1;
+  if (silences.length < needed) return null;
+  // Take the N-1 LONGEST silences as the scene boundaries (natural
+  // sentence pauses inside a scene are ~0.2-0.5s; the inserted
+  // <long pause> between scenes is ~1.2s+, so the longest ones win).
+  const boundaries = silences
+    .slice()
+    .sort((a, b) => b.duration - a.duration)
+    .slice(0, needed)
+    .sort((a, b) => a.start - b.start)
+    .map((s) => (s.start + s.end) / 2);
+  const cuts = [0, ...boundaries, totalSec];
+  const segments = [];
+  for (let i = 0; i < sceneCount; i++) {
+    const num = scenes[i].sceneNumber || i + 1;
+    const out = path.join(workDir, `scene_${num}.mp3`);
+    // -ss/-to BEFORE -i are input options: absolute timestamps in the file.
+    await execFileAsync('ffmpeg', [
+      '-y', '-ss', String(cuts[i]), '-to', String(cuts[i + 1]),
+      '-i', wholeMp3, '-c', 'copy', out,
+    ]);
+    const durationSec = await ffprobeDuration(out);
+    if (!durationSec || durationSec < 0.5) return null;
+    segments.push({ path: out, durationSec });
+  }
+  return segments;
+}
+
+/**
+ * Batched TTS: one Gemini call for a whole chunk of scenes, then split the
+ * audio back into per-scene clips. This is the fix for the 10/day free-tier
+ * ceiling — the quota counts REQUESTS, not minutes, and one call returns
+ * ~11 min of audio, so a 5-min recap costs 1 request instead of 7.
+ * Scenes are joined with <long pause> (a documented Gemini TTS inline tag)
+ * so the split can find the boundaries; if the split fails, only that
+ * chunk falls back to per-scene calls — a bad split never fails the job.
+ * Returns scenes with audioPath + audioDurationSec.
+ */
+async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOICE) {
+  fs.mkdirSync(audioDir, { recursive: true });
+  // Group scenes so each chunk is at most ~9 min of estimated audio
+  // (one call returns ~11 min max). ~20 Burmese chars ≈ 1s of speech is a
+  // conservative estimate from the proven per-scene jobs.
+  const MAX_CHUNK_SEC = 540;
+  const chunks = [];
+  let cur = [];
+  let curSec = 0;
+  for (const scene of scenes) {
+    const est = Math.max(3, (scene.narrationMy || '').length / 20);
+    if (cur.length > 0 && curSec + est > MAX_CHUNK_SEC) {
+      chunks.push(cur);
+      cur = [];
+      curSec = 0;
+    }
+    cur.push(scene);
+    curSec += est;
+  }
+  if (cur.length > 0) chunks.push(cur);
+
+  const out = [];
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c];
+    const joined = chunk.map((s) => s.narrationMy).join('\n<long pause>\n');
+    const wholeMp3 = path.join(audioDir, `whole_${c}.mp3`);
+    const wavPath = path.join(audioDir, `whole_${c}.wav`);
+    const buffer = await generateTtsAudioBuffer(
+      joined,
+      voiceName,
+      `batched TTS chunk ${c + 1}/${chunks.length}`
+    );
+    audioBufferToWav(buffer, wavPath);
+    await execFileAsync('ffmpeg', ['-y', '-i', wavPath, '-codec:a', 'libmp3lame', '-q:a', '4', wholeMp3]);
+    fs.unlinkSync(wavPath);
+    const segments = await splitAudioBySilence(wholeMp3, chunk, audioDir);
+    if (!segments) {
+      console.log(`[gemini] batched split failed for chunk ${c + 1} — falling back to per-scene TTS for its ${chunk.length} scenes`);
+      const fallback = await generateAllSceneAudio(chunk, audioDir, voiceName);
+      out.push(...fallback);
+    } else {
+      chunk.forEach((scene, i) =>
+        out.push({ ...scene, audioPath: segments[i].path, audioDurationSec: segments[i].durationSec })
+      );
+    }
+    try {
+      fs.unlinkSync(wholeMp3);
+    } catch (_) {}
+  }
+  return out;
+}
+
 module.exports = {
   ANALYSIS_MODEL,
+  SCRIPT_MODEL,
   TTS_MODEL,
+  TTS_MODELS,
   requireApiKey,
   ffprobeDuration,
   extractFrames,
   analyzeVideo,
   generateScript,
   generateSceneAudio,
+  generateRecapAudio,
+  splitAudioBySilence,
   SCENE_COUNT_BY_MINUTES,
 };

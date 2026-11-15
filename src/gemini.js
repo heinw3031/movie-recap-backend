@@ -22,6 +22,57 @@ const { promisify } = require('util');
 
 const execFileAsync = promisify(execFile);
 
+// 2026-11-15: Gemini free tier is strict — gemini-3.8-flash returns 503
+// "high demand" when overloaded, and gemini-3.8-flash-tts allows only
+// 3 requests/minute (429 RESOURCE_EXHAUSTED, "retry in 48s"). The pipeline
+// used to fail the whole job on the first such error. Now every Gemini
+// call retries with backoff, and TTS calls are spaced out so the quota
+// is never hit in the first place.
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayFromError(err) {
+  const m = String((err && err.message) || '').match(/retry in ([\d.]+)s/i);
+  if (m) return Math.ceil(parseFloat(m[1]) * 1000);
+  return null;
+}
+
+function isRetryableError(err) {
+  const msg = String((err && err.message) || '');
+  return (
+    /429|503|UNAVAILABLE|RESOURCE_EXHAUSTED|fetch failed|ECONNRESET|ETIMEDOUT/i.test(msg)
+  );
+}
+
+async function withRetry(fn, what) {
+  const delays = [15000, 30000, 60000, 60000, 90000];
+  let lastErr;
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableError(err) || attempt === delays.length) throw err;
+      const hinted = retryDelayFromError(err);
+      const wait = Math.min(Math.max(hinted || delays[attempt], delays[attempt]), 120000);
+      console.log(`[gemini] ${what} failed (attempt ${attempt + 1}): ${String(err.message).slice(0, 120)} — retrying in ${Math.round(wait / 1000)}s`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
+// Free-tier TTS quota is 3 requests/minute per model. Space TTS calls
+// at least 21s apart so a 7-scene (or 38-scene) script never trips it.
+let lastTtsAt = 0;
+async function throttleTts() {
+  const gapMs = 21000;
+  const wait = lastTtsAt + gapMs - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastTtsAt = Date.now();
+}
+
 // 2026-11-15: gemini-2.5-flash returns 404 "no longer available to new
 // users" for this API key, and gemini-2.5-flash-preview-tts is the same
 // generation — both replaced with the 3.8 generation (verified live in
@@ -136,10 +187,14 @@ async function analyzeVideo(videoPath, framesDir) {
     ].join('\n'),
   });
 
-  const response = await ai.models.generateContent({
-    model: ANALYSIS_MODEL,
-    contents: [{ parts }],
-  });
+  const response = await withRetry(
+    () =>
+      ai.models.generateContent({
+        model: ANALYSIS_MODEL,
+        contents: [{ parts }],
+      }),
+    'video analysis'
+  );
   const text = response.text;
   if (!text) throw new Error('Gemini analysis returned no text.');
   const parsed = parseJsonResponse(text, 'video analysis');
@@ -184,11 +239,15 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
 
-  const response = await ai.models.generateContent({
-    model: ANALYSIS_MODEL,
-    contents: prompt,
-    config: { responseMimeType: 'application/json' },
-  });
+  const response = await withRetry(
+    () =>
+      ai.models.generateContent({
+        model: ANALYSIS_MODEL,
+        contents: prompt,
+        config: { responseMimeType: 'application/json' },
+      }),
+    'script generation'
+  );
   const text = response.text;
   if (!text) throw new Error('Gemini script generation returned no text.');
   const parsed = parseJsonResponse(text, 'Burmese script');
@@ -240,16 +299,21 @@ function writePcmAsWav(pcmBuffer, outPath) {
 async function generateSceneAudio(textMy, outMp3Path, voiceName = DEFAULT_TTS_VOICE) {
   const ai = getClient();
   if (!textMy || !textMy.trim()) throw new Error('generateSceneAudio: empty narration text.');
-  const response = await ai.models.generateContent({
-    model: TTS_MODEL,
-    contents: [{ parts: [{ text: textMy }] }],
-    config: {
-      responseModalities: ['AUDIO'],
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName } },
-      },
-    },
-  });
+  await throttleTts();
+  const response = await withRetry(
+    () =>
+      ai.models.generateContent({
+        model: TTS_MODEL,
+        contents: [{ parts: [{ text: textMy }] }],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName } },
+          },
+        },
+      }),
+    'scene TTS'
+  );
   const parts = (response.candidates && response.candidates[0] && response.candidates[0].content && response.candidates[0].content.parts) || [];
   const audioPart = parts.find((p) => p.inlineData && p.inlineData.data);
   if (!audioPart) {

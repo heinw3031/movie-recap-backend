@@ -358,9 +358,12 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     .map((s) => `${s.startSec}s-${s.endSec}s: ${s.description}`)
     .join('\n');
 
+  // Target narration length: the finished recap must actually last about
+  // lengthMinutes — each scene's narration should fill its share.
+  const targetSecPerScene = Math.round((lengthMinutes * 60) / sceneCount);
   const prompt = [
-    'You are a professional Myanmar (Burmese) movie-recap narrator for YouTube/Facebook — you speak like a friend telling an exciting story out loud, NOT like a newsreader reading an essay.',
-    'Write a gripping, natural Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
+    'You are a Myanmar movie-recap narrator in the style of the most popular Burmese recap channels (Recappian Myanmar 2.0, TV Myanmar Recap "Kwee") — a funny friend telling the story out loud to friends, NOT a newsreader reading an essay.',
+    'Write a gripping Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
     'Base the story ONLY on these real scene summaries from the video — do not invent characters, twists or an ending that is not in the summaries:',
     summaryText,
@@ -368,8 +371,19 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":90,"narrationMy":"..."}]}',
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
     '- "sourceStartSec"/"sourceEndSec" must be real timestamps from the summaries above, so the clip cut from the source video matches this scene.',
-    '- "narrationMy": SPOKEN Burmese, not written Burmese. Write exactly as a Myanmar friend would TELL this story out loud to another friend — like a popular Myanmar YouTube recap narrator. Use everyday spoken expressions and particles (ဗျာ, လေ, ဟာ, တော့, ဆိုတော့, အဲဒီနောက်, ဒီလိုနဲ့, တကယ်တော့, ကြည့်ရတာ), short punchy sentences, natural pauses, and the occasional rhetorical question ("ဘာဖြစ်မလဲ ဆိုတော့..."). NEVER use formal written forms (သည်, သော, ခြင်း, မှု, ၏). 2-3 SHORT sentences per scene. Short sentences help Burmese TTS pronounce English names and numbers. Write English movie/character names in a simple phonetic way where needed.',
-    '- Each scene\'s narration must describe ONLY what is actually visible and happening inside that scene\'s own sourceStartSec–sourceEndSec window — never jump ahead to a later event, never invent an event that is not in the summaries, and never repeat another scene\'s event. The clip cut from that window and the words heard over it must show the SAME thing.',
+    '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
+    '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
+    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. If a line contains သည်/များ/၏/၌ it will sound like written text read aloud.',
+    '  2. One event per clause; chain clauses with …တော့ / …ပြီးတော့ / …ပြီးရင် / ဒီတော့. Short clauses, one breath each.',
+    '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro. Start with the spoiler premise, then a hook question ("ဘာတွေဆက်ဖြစ်မလဲ").',
+    '  4. Address the viewer directly at least twice (opening hook + closing) with soft particles — နော် / ပါဦး / လေး.',
+    '  5. Dramatise the turning point: name the weakness, the counter-move, the decisive action — one vivid verb per beat. Describe feelings through reactions ("froze", "the crowd erupted", "kept getting back up"), never interior monologue.',
+    '  6. Be a funny friend watching with the viewer: joke or comment at the villain\'s or the scary scene\'s expense at least once where it fits.',
+    '  7. Keep foreign character/movie names in English (never translate a name); gloss concepts in Burmese. Write English names phonetically only if they must be spoken in Burmese script.',
+    '  8. Paraphrase dialogue; quote at most one short punchline in the whole recap.',
+    '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside that scene\'s own sourceStartSec–sourceEndSec window — never jump ahead, never invent, never repeat another scene\'s event. The clip cut from that window and the words over it must show the SAME thing.',
+    '  10. LENGTH: each scene\'s narration must last about ' + targetSecPerScene + ' seconds when spoken (roughly ' + targetSecPerScene * 20 + ' Burmese characters of short clauses), so the whole recap lasts about ' + lengthMinutes + ' minutes. Too short is a failure — add more beats, reactions and comments until the scene is full.',
+    '  11. End the LAST scene with a soft closing line inviting viewers to keep watching / subscribe to the little channel, with နော် / ပါဦး.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
 
@@ -463,7 +477,7 @@ async function generateTtsAudioBuffer(text, voiceName, what) {
               {
                 parts: [
                   {
-                    text: `Say it like a Myanmar friend telling an exciting movie story out loud — natural, conversational, dramatic when it fits: ${text}`,
+                    text: `Say it like a funny Myanmar friend telling a movie story to friends — fast, punchy, one beat at a time, dramatic at the turning points, with a joke where it fits: ${text}`,
                   },
                 ],
               },

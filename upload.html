@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Upload test video</title></head>
+<body>
+<h1>Upload test video to movie-recap-backend</h1>
+<form action="https://movie-recap-backend-production.up.railway.app/api/jobs" method="post" enctype="multipart/form-data">
+<p><label>Video file: <input type="file" name="video" required></label></p>
+<p><label>Length (minutes): <input type="number" name="lengthMinutes" value="5" min="5" max="30"></label></p>
+<p><label>Category: <input type="text" name="category" value="Action"></label></p>
+<p><button type="submit">Upload and create job</button></p>
+</form>
+</body>
+</html>

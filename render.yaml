@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: movie-recap-backend
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "100"

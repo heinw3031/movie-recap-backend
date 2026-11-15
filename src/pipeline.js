@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const store = require('./store');
 const gemini = require('./gemini');
+const edgeTts = require('./edgeTts');
 const render = require('./render');
 
 function setStage(jobId, status, progress, extra = {}) {
@@ -78,13 +79,29 @@ async function runGenerate(jobId) {
 
   try {
     // --- TTS ---
-    // Default: ONE Gemini call for the whole recap (batched), split back
-    // into per-scene clips — the free tier counts REQUESTS (10/day/model),
-    // not minutes, so a 5-min recap costs 1 request instead of 7.
-    // TTS_BATCH=0 restores the old one-call-per-scene path.
+    // TTS_ENGINE: 'gemini' (default — batched, ONE call per recap;
+    // TTS_BATCH=0 restores one-call-per-scene), 'edge' (Microsoft Edge
+    // TTS, my-MM-ThihaNeural male Burmese voice, no quota), 'auto'
+    // (Gemini first, Edge fallback when Gemini's daily quota is gone).
+    // The free tier counts REQUESTS (10/day/model), not minutes, so a
+    // 5-min Gemini recap costs 1 batched request instead of 7.
     const total = job.scenes.length;
+    const engine = process.env.TTS_ENGINE || 'gemini';
     let scenesWithAudio;
-    if (process.env.TTS_BATCH === '0') {
+    if (engine === 'edge') {
+      setStage(jobId, 'tts', 45);
+      scenesWithAudio = await edgeTts.generateAllSceneAudioEdge(job.scenes, audioDir);
+      store.updateJob(jobId, {
+        scenes: scenesWithAudio,
+        audioDurations: Object.fromEntries(
+          scenesWithAudio.map((s) => [s.sceneNumber, s.audioDurationSec])
+        ),
+      });
+      scenesWithAudio.forEach((s, i) =>
+        console.log(`[job ${jobId}] TTS scene ${i + 1}/${total}: ${s.audioDurationSec.toFixed(1)}s (edge)`)
+      );
+      setStage(jobId, 'tts', 70);
+    } else if (process.env.TTS_BATCH === '0') {
       scenesWithAudio = [];
       for (let i = 0; i < total; i++) {
         const scene = job.scenes[i];
@@ -102,7 +119,16 @@ async function runGenerate(jobId) {
       }
     } else {
       setStage(jobId, 'tts', 45);
-      scenesWithAudio = await gemini.generateRecapAudio(job.scenes, audioDir);
+      try {
+        scenesWithAudio = await gemini.generateRecapAudio(job.scenes, audioDir);
+      } catch (err) {
+        if (engine === 'auto' && gemini.isDailyQuotaError(err)) {
+          console.log(`[job ${jobId}] Gemini daily TTS quota exhausted — falling back to Edge TTS`);
+          scenesWithAudio = await edgeTts.generateAllSceneAudioEdge(job.scenes, audioDir);
+        } else {
+          throw err;
+        }
+      }
       store.updateJob(jobId, {
         scenes: scenesWithAudio,
         audioDurations: Object.fromEntries(

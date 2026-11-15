@@ -601,6 +601,7 @@ module.exports = {
   SCRIPT_MODEL,
   TTS_MODEL,
   TTS_MODELS,
+  isDailyQuotaError,
   requireApiKey,
   ffprobeDuration,
   extractFrames,

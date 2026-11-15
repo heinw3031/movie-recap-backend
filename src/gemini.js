@@ -99,6 +99,11 @@ async function throttleTts() {
 // is tested — switch with SCRIPT_MODEL=gemini-3.5-flash-lite.
 const ANALYSIS_MODEL = process.env.ANALYSIS_MODEL || 'gemini-3.8-flash';
 const SCRIPT_MODEL = process.env.SCRIPT_MODEL || ANALYSIS_MODEL;
+// ANALYSIS_MODE: 'frames' (default — extract 1 frame/30s, send as images)
+// or 'files' (Gemini Files API — upload the whole video once, Gemini watches
+// AND listens, so dialogue-driven scenes are no longer missed, and there is
+// no frame-extraction step at all). 'files' falls back to 'frames' on error.
+const ANALYSIS_MODE = process.env.ANALYSIS_MODE || 'frames';
 const TTS_MODELS = (process.env.TTS_MODELS || process.env.TTS_MODEL || 'gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts')
   .split(',')
   .map((s) => s.trim())
@@ -237,6 +242,106 @@ async function analyzeVideo(videoPath, framesDir) {
 
 const SCENE_COUNT_BY_MINUTES = { 5: 7, 10: 13, 15: 20, 30: 38 };
 
+function mimeTypeForVideo(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return (
+    {
+      '.mp4': 'video/mp4',
+      '.mov': 'video/quicktime',
+      '.webm': 'video/webm',
+      '.ogv': 'video/ogg',
+      '.ogg': 'video/ogg',
+      '.mkv': 'video/x-matroska',
+    }[ext] || 'video/mp4'
+  );
+}
+
+async function waitForFileActive(ai, name, timeoutMs = 120000) {
+  const started = Date.now();
+  for (;;) {
+    const f = await ai.files.get({ name });
+    if (f.state === 'ACTIVE') return f;
+    if (f.state === 'FAILED') {
+      throw new Error(`Gemini Files API: uploaded file entered FAILED state (${name}).`);
+    }
+    if (Date.now() - started > timeoutMs) {
+      throw new Error('Gemini Files API: timed out waiting for the uploaded video to become ACTIVE.');
+    }
+    await sleep(5000);
+  }
+}
+
+/**
+ * Analyse with the Gemini Files API: upload the whole video once and let
+ * Gemini watch AND listen to it (picture + dialogue/audio). One call for
+ * the whole video, no frame extraction, and dialogue-driven twists are no
+ * longer missed. The uploaded file is deleted afterwards. Throws on failure
+ * — the caller (analyzeVideoAuto) falls back to frame analysis.
+ */
+async function analyzeVideoWithFiles(videoPath) {
+  const ai = getClient();
+  const mimeType = mimeTypeForVideo(videoPath);
+  const duration = await ffprobeDuration(videoPath);
+  const file = await withRetry(
+    () => ai.files.upload({ file: videoPath, config: { mimeType } }),
+    'video upload (Files API)'
+  );
+  try {
+    await waitForFileActive(ai, file.name);
+    const response = await withRetry(
+      () =>
+        ai.models.generateContent({
+          model: ANALYSIS_MODEL,
+          contents: [
+            {
+              parts: [
+                { fileData: { mimeType, fileUri: file.uri } },
+                {
+                  text: [
+                    'Watch AND listen to this video (picture and sound/dialogue).',
+                    'Do NOT invent a plot from the filename. Describe only what you can see and hear.',
+                    'Return JSON only, no markdown, in this exact shape:',
+                    '{"scenes":[{"startSec":0,"endSec":90,"description":"what happens in this stretch, in English, 1-2 sentences"}]}',
+                    'Cover the whole video from 0s to the end, in chronological order. Merge similar stretches; aim for 6-15 scenes.',
+                    `Video duration is ${Math.round(duration)} seconds.`,
+                  ].join('\n'),
+                },
+              ],
+            },
+          ],
+        }),
+      'video analysis (Files API)'
+    );
+    const text = response.text;
+    if (!text) throw new Error('Gemini Files API analysis returned no text.');
+    const parsed = parseJsonResponse(text, 'video analysis (Files API)');
+    const scenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
+    if (scenes.length === 0) throw new Error('Gemini Files API analysis returned no scenes.');
+    return scenes.map((s) => ({
+      startSec: Number(s.startSec) || 0,
+      endSec: Number(s.endSec) || 0,
+      description: String(s.description || '').trim(),
+    }));
+  } finally {
+    try {
+      await ai.files.delete({ name: file.name });
+    } catch (_) {}
+  }
+}
+
+/** Analyse dispatch: Files API when ANALYSIS_MODE=files (with frame fallback), else frames. */
+async function analyzeVideoAuto(videoPath, framesDir) {
+  if (ANALYSIS_MODE === 'files') {
+    try {
+      return await analyzeVideoWithFiles(videoPath);
+    } catch (err) {
+      console.log(`[analysis] Files API failed (${String(err.message).slice(0, 160)}) — falling back to frame analysis`);
+      return analyzeVideo(videoPath, framesDir);
+    }
+  }
+  return analyzeVideo(videoPath, framesDir);
+}
+
 /**
  * Generate a Burmese scene-by-scene recap script from REAL scene summaries.
  * Returns { title, scenes: [{ sceneNumber, startSec, endSec, sourceStartSec, sourceEndSec, narrationMy }] }
@@ -254,7 +359,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     .join('\n');
 
   const prompt = [
-    'You are a professional Myanmar (Burmese) movie-recap narrator for YouTube/Facebook.',
+    'You are a professional Myanmar (Burmese) movie-recap narrator for YouTube/Facebook — you speak like a friend telling an exciting story out loud, NOT like a newsreader reading an essay.',
     'Write a gripping, natural Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
     'Base the story ONLY on these real scene summaries from the video — do not invent characters, twists or an ending that is not in the summaries:',
@@ -263,7 +368,8 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":90,"narrationMy":"..."}]}',
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
     '- "sourceStartSec"/"sourceEndSec" must be real timestamps from the summaries above, so the clip cut from the source video matches this scene.',
-    '- "narrationMy": natural, expressive Burmese Unicode, 2-3 SHORT sentences per scene, suitable for voiceover. Short sentences help Burmese TTS pronounce English names and numbers. Write English movie/character names in a simple phonetic way where needed.',
+    '- "narrationMy": SPOKEN Burmese, not written Burmese. Write exactly as a Myanmar friend would TELL this story out loud to another friend — like a popular Myanmar YouTube recap narrator. Use everyday spoken expressions and particles (ဗျာ, လေ, ဟာ, တော့, ဆိုတော့, အဲဒီနောက်, ဒီလိုနဲ့, တကယ်တော့, ကြည့်ရတာ), short punchy sentences, natural pauses, and the occasional rhetorical question ("ဘာဖြစ်မလဲ ဆိုတော့..."). NEVER use formal written forms (သည်, သော, ခြင်း, မှု, ၏). 2-3 SHORT sentences per scene. Short sentences help Burmese TTS pronounce English names and numbers. Write English movie/character names in a simple phonetic way where needed.',
+    '- Each scene\'s narration must describe ONLY what is actually visible and happening inside that scene\'s own sourceStartSec–sourceEndSec window — never jump ahead to a later event, never invent an event that is not in the summaries, and never repeat another scene\'s event. The clip cut from that window and the words heard over it must show the SAME thing.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
 
@@ -350,7 +456,18 @@ async function generateTtsAudioBuffer(text, voiceName, what) {
         () =>
           ai.models.generateContent({
             model,
-            contents: [{ parts: [{ text }] }],
+            // Style direction: Gemini TTS treats a leading "Say ..." instruction
+            // as a delivery direction, not as text to speak. Spoken, conversational
+            // storytelling — not a newsreader reading an essay.
+            contents: [
+              {
+                parts: [
+                  {
+                    text: `Say it like a Myanmar friend telling an exciting movie story out loud — natural, conversational, dramatic when it fits: ${text}`,
+                  },
+                ],
+              },
+            ],
             config: {
               responseModalities: ['AUDIO'],
               speechConfig: {
@@ -606,6 +723,8 @@ module.exports = {
   ffprobeDuration,
   extractFrames,
   analyzeVideo,
+  analyzeVideoWithFiles,
+  analyzeVideoAuto,
   generateScript,
   generateSceneAudio,
   generateRecapAudio,

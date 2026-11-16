@@ -427,8 +427,11 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   const ai = getClient();
   if (![5, 10, 15, 30, 60].includes(lengthMinutes)) {
     throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15, 30 or 60 minutes.`);
-  }
-  const sceneCount = SCENE_COUNT_BY_MINUTES[lengthMinutes];
+  // ONE SCENE PER BEAT — every analysed beat becomes a scene. The model
+    // kept "picking" beats and dropping turning points (the orange laser grid
+    // 190-235s was dropped twice, in the lite run AND the 3.8-flash run), so
+    // selection is no longer the model's choice. Scene count = beat count.
+    const sceneCount = sceneSummaries.length;
   const summaryText = sceneSummaries
     .map((s) => {
       const moments = (s.moments || []).map((m) => `  ${m.atSec}s: ${m.what}`).join('\n');
@@ -451,7 +454,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     'Requirements (return JSON only, no markdown):',
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
-    '- ONE SCENE PER BEAT: pick ' + sceneCount + ' beats in story order (skip the dull ones, keep the turning points). Each scene uses ONE beat only — never merge two beats into one scene, never split a beat, never widen a window. Cover EVERY turning point — never skip a beat whose moments start a new phase of the story (e.g. a reconstruction starting, a new weapon appearing, the hero entering the simulation).',
+    '- ONE SCENE PER BEAT: use EVERY beat below — one scene per beat, in story order. NEVER skip a beat, NEVER drop a beat because it looks dull, NEVER merge two beats into one scene, never split a beat, never widen a window. Every beat is a scene; the scene count is ' + sceneCount + ' because there are ' + sceneCount + ' beats.',
     '- CLIP RANGE, NOT THE WHOLE BEAT: "sourceStartSec"/"sourceEndSec" must be the exact timestamps of the moments this scene\'s narration actually describes — a contiguous range INSIDE its beat. If the beat is 50-95s but the narration is only about the brain examination at 80-95s, the scene\'s window is 80-95s, NOT 50-95s. The viewer only ever sees this range while the narration plays, so the words and the picture show the SAME thing at the SAME time.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',

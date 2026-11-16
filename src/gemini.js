@@ -377,7 +377,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   // lengthMinutes — each scene's narration should fill its share.
   const targetSecPerScene = Math.round((lengthMinutes * 60) / sceneCount);
   const prompt = [
-    'You are a Myanmar movie-recap narrator in the style of the most popular Burmese recap channels (Recappian Myanmar 2.0, TV Myanmar Recap "Kwee") — a funny friend telling the story out loud to friends, NOT a newsreader reading an essay.',
+    'You are the narrator of Recappian Myanmar 2.0 — the most popular Burmese recap channel (883K subs). Fast, dense, matter-of-fact storytelling. NOT a funny friend chatting, NOT a newsreader, and NEVER an old man (ဘိုးတော်) talking politely.',
     'Write a gripping Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
     'Base the story ONLY on these real beats from the video — do not invent characters, twists or an ending that is not in the beats. Each beat is one short moment (30-60s) with exact timestamps:',
@@ -385,21 +385,21 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     'Requirements (return JSON only, no markdown):',
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
-    '- ONE SCENE PER BEAT: pick ' + sceneCount + ' beats in story order (skip the dull ones, keep the turning points). Each scene uses ONE beat only — never merge two beats into one scene, never split a beat, never widen a window.',
+    '- ONE SCENE PER BEAT: pick ' + sceneCount + ' beats in story order (skip the dull ones, keep the turning points). Each scene uses ONE beat only — never merge two beats into one scene, never split a beat, never widen a window. Cover EVERY turning point — never skip a beat whose moments start a new phase of the story (e.g. a reconstruction starting, a new weapon appearing, the hero entering the simulation).',
     '- CLIP RANGE, NOT THE WHOLE BEAT: "sourceStartSec"/"sourceEndSec" must be the exact timestamps of the moments this scene\'s narration actually describes — a contiguous range INSIDE its beat. If the beat is 50-95s but the narration is only about the brain examination at 80-95s, the scene\'s window is 80-95s, NOT 50-95s. The viewer only ever sees this range while the narration plays, so the words and the picture show the SAME thing at the SAME time.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
-    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. If a line contains သည်/များ/၏/၌ it will sound like written text read aloud.',
-    '  2. One event per clause; chain clauses with …တော့ / …ပြီးတော့ / …ပြီးရင် / ဒီတော့. Short clauses, one breath each.',
-    '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro. Start with the spoiler premise, then a hook question ("ဘာတွေဆက်ဖြစ်မလဲ").',
-    '  4. Address the viewer directly at least twice (opening hook + closing) with soft particles — နော် / ပါဦး / လေး.',
+    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the ပါတယ် register (e.g. ဖြစ်ပါတယ်, ပြောပါတယ်, လုပ်လိုက်ပါတယ်).',
+    '  2. LONG, DENSE sentences — pack 4-7 events into one flowing sentence, chained with …ပြီး / …တော့ / …ကြောင့် / ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး. NEVER write short choppy one-event clauses — real recaps tell fast and dense, one sentence covers a whole chain of events.',
+    '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro, no hook question. Start with the premise and run.',
+    '  4. NEVER address the viewer directly — no နော် / ပါဦး / လေး to the viewer, no questions to the viewer, no "keep watching" lines. Just tell the story.',
     '  5. Dramatise the turning point: name the weakness, the counter-move, the decisive action — one vivid verb per beat. Describe feelings through reactions ("froze", "the crowd erupted", "kept getting back up"), never interior monologue.',
-    '  6. Be a funny friend watching with the viewer: joke or comment at the villain\'s or the scary scene\'s expense at least once where it fits.',
-    '  7. Keep foreign character/movie names in English (never translate a name); gloss concepts in Burmese. Write English names phonetically only if they must be spoken in Burmese script.',
-    '  8. Paraphrase dialogue; quote at most one short punchline in the whole recap.',
+    '  6. No forced jokes. If a moment is funny, say it straight — do not add a joke where the story has none.',
+    '  7. Transliterate ALL foreign character/movie names into Burmese script (Charlie → ချာလီ, Max → မက်, Noisy Boy → နွိုင်စီဝိုင်း). NEVER leave English names in the narration.',
+    '  8. Paraphrase dialogue as reported speech with …ဆိုပြီး / …လို့ (e.g. "ကိုယ့်သားကိုယ်တောင်ရောင်းစားတဲ့အဖေဆိုပြီး မုန်နေပါတယ်"). Quote at most one short punchline in the whole recap.',
     '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside its own clip range (sourceStartSec–sourceEndSec) — and IN TIME ORDER: walk through the range\'s moments from first to last, one clause per moment, exactly as they appear on screen. Never jump ahead to a later moment, never invent, never repeat another scene\'s event. If the range shows a bridge argument, say ONLY the bridge argument; if it shows a lab, say ONLY the lab.',
     '  10. LENGTH: each scene\'s narration must last about as long as its clip range (range seconds x 20 Burmese characters of short clauses) — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. A narration much shorter than its range means the moments at the END of the range are never seen or heard — fill the range in order, adding more moments, reactions and comments until the scene is full. Too short is a failure.',
-    '  11. End the LAST scene with a soft closing line inviting viewers to keep watching / subscribe to the little channel, with နော် / ပါဦး.',
+    '  11. End the LAST scene with the story\'s closing beat. No subscribe call, no closing line to the viewer — the story ends when the story ends.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
 
@@ -465,7 +465,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   });
   if (short.length > 0) {
     const expandPrompt = [
-      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 20 Burmese characters per second). Keep the same clip range, the same spoken style (zero literary သည်/များ/၏/၌, one event per clause, in time order over the range\'s moments), and describe ONLY what happens inside the range.',
+      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 20 Burmese characters per second). Keep the same clip range and the same style: no ဗျာ/ဗျ ever, no literary သည်/များ/၏/၌, long dense sentences (4-7 events per sentence, chained with ပြီး/တော့/ကြောင့်/ဒါပေမဲ့/အဲ့ဒါကြောင့်), ပါတယ် endings, transliterated names, in time order over the range\'s moments, and describe ONLY what happens inside the range.',
       'Return JSON only, no markdown: {"scenes":[{"sceneNumber":1,"narrationMy":"..."}]}',
       ...short.map(
         (s) =>

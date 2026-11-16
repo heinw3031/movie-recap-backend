@@ -191,7 +191,25 @@ async function extractFrames(videoPath, outDir, intervalSec = 30) {
  * Never invents a story from the filename alone — if no frames could be
  * extracted, it throws instead of guessing.
  */
-async function analyzeVideo(videoPath, framesDir) {
+async function detectFirstNonBlackSec(videoPath) {
+  // Best-effort: find where the opening fade-from-black ends, so the first
+  // beat starts on real picture instead of black frames (Tears of Steel
+  // fades in from black for ~9s; the lite analysis started its first beat
+  // at 0s and the recap opened on 9s of black). Returns null on any error.
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      'ffmpeg',
+      ['-i', videoPath, '-vf', 'blackdetect=d=0.1:pix_th=0.10', '-f', 'null', '-'],
+      { timeout: 60000 }
+    );
+    const log = `${stdout}\n${stderr}`;
+    const m = log.match(/black_start:0(?:\.0+)?\s+black_end:([0-9.]+)/);
+    if (m) return Math.ceil(parseFloat(m[1]));
+  } catch (_) { /* fall through */ }
+  return null;
+}
+
+async function analyzeVideo(videoPath, framesDir, firstNonBlackSec = null) {
   const ai = getClient();
   const frames = await extractFrames(videoPath, framesDir, 30);
   if (frames.length === 0) {
@@ -217,7 +235,7 @@ async function analyzeVideo(videoPath, framesDir) {
       '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
       'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
       'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
-      'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.',
+      'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.' + (firstNonBlackSec !== null ? ` The video fades in from black; the first real picture is at about ${firstNonBlackSec}s — the first beat must start at or after ${firstNonBlackSec}s.` : ''),
       'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
       `Video duration is ${Math.round(duration)} seconds.`,
     ].join('\n'),
@@ -284,7 +302,7 @@ async function waitForFileActive(ai, name, timeoutMs = 120000) {
  * longer missed. The uploaded file is deleted afterwards. Throws on failure
  * — the caller (analyzeVideoAuto) falls back to frame analysis.
  */
-async function analyzeVideoWithFiles(videoPath) {
+async function analyzeVideoWithFiles(videoPath, firstNonBlackSec = null) {
   const ai = getClient();
   const mimeType = mimeTypeForVideo(videoPath);
   const duration = await ffprobeDuration(videoPath);
@@ -310,7 +328,7 @@ async function analyzeVideoWithFiles(videoPath) {
                     '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
                     'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
                     'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
-                    'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.',
+                    'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.' + (firstNonBlackSec !== null ? ` The video fades in from black; the first real picture is at about ${firstNonBlackSec}s — the first beat must start at or after ${firstNonBlackSec}s.` : ''),
                     'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
                     `Video duration is ${Math.round(duration)} seconds.`,
                   ].join('\n'),
@@ -343,15 +361,17 @@ async function analyzeVideoWithFiles(videoPath) {
 
 /** Analyse dispatch: Files API when ANALYSIS_MODE=files (with frame fallback), else frames. */
 async function analyzeVideoAuto(videoPath, framesDir) {
+  const firstNonBlackSec = await detectFirstNonBlackSec(videoPath);
+  if (firstNonBlackSec !== null) console.log(`[analysis] first real picture at ~${firstNonBlackSec}s (opening fade from black)`);
   if (ANALYSIS_MODE === 'files') {
     try {
-      return await analyzeVideoWithFiles(videoPath);
+      return await analyzeVideoWithFiles(videoPath, firstNonBlackSec);
     } catch (err) {
       console.log(`[analysis] Files API failed (${String(err.message).slice(0, 160)}) — falling back to frame analysis`);
-      return analyzeVideo(videoPath, framesDir);
+      return analyzeVideo(videoPath, framesDir, firstNonBlackSec);
     }
   }
-  return analyzeVideo(videoPath, framesDir);
+  return analyzeVideo(videoPath, framesDir, firstNonBlackSec);
 }
 
 /**
@@ -389,7 +409,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '- CLIP RANGE, NOT THE WHOLE BEAT: "sourceStartSec"/"sourceEndSec" must be the exact timestamps of the moments this scene\'s narration actually describes — a contiguous range INSIDE its beat. If the beat is 50-95s but the narration is only about the brain examination at 80-95s, the scene\'s window is 80-95s, NOT 50-95s. The viewer only ever sees this range while the narration plays, so the words and the picture show the SAME thing at the SAME time.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
-    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the ပါတယ် register (e.g. ဖြစ်ပါတယ်, ပြောပါတယ်, လုပ်လိုက်ပါတယ်).',
+    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the ပါတယ် register (e.g. ဖြစ်ပါတယ်, ပြောပါတယ်, လုပ်လိုက်ပါတယ်). Every scene\'s narration must END with ပါတယ် — never end with ပါတော့တယ် or တယ်.',
     '  2. LONG, DENSE sentences — pack 4-7 events into one flowing sentence, chained with …ပြီး / …တော့ / …ကြောင့် / ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး. NEVER write short choppy one-event clauses — real recaps tell fast and dense, one sentence covers a whole chain of events.',
     '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro, no hook question. Start with the premise and run.',
     '  4. NEVER address the viewer directly — no နော် / ပါဦး / လေး to the viewer, no questions to the viewer, no "keep watching" lines. Just tell the story.',

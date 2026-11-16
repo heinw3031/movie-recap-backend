@@ -470,18 +470,12 @@ async function generateTtsAudioBuffer(text, voiceName, what) {
         () =>
           ai.models.generateContent({
             model,
-            // Style direction: Gemini TTS treats a leading "Say ..." instruction
-            // as a delivery direction, not as text to speak. Spoken, conversational
-            // storytelling — not a newsreader reading an essay.
-            contents: [
-              {
-                parts: [
-                  {
-                    text: `Say it like a funny Myanmar friend telling a movie story to friends — fast, punchy, one beat at a time, dramatic at the turning points, with a joke where it fits: ${text}`,
-                  },
-                ],
-              },
-            ],
+            // NOTE: do NOT prepend a "Say it like..." style direction to the
+            // text — gemini-3.8-flash-tts reads it aloud instead of treating
+            // it as an instruction (job 1dea9983 spoke the English direction
+            // for ~25s before the Burmese narration). The narration text
+            // itself already carries the spoken style; send it plain.
+            contents: [{ parts: [{ text }] }],
             config: {
               responseModalities: ['AUDIO'],
               speechConfig: {

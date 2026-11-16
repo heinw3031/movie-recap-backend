@@ -231,10 +231,12 @@ async function analyzeVideo(videoPath, framesDir, firstNonBlackSec = null) {
     text: [
       'These are real frames, in time order, from the uploaded video.',
       'Do NOT invent a plot from the filename. Describe only what you can see in these frames.',
+      'Describe ONLY what is literally visible — what people and robots actually DO, in plain words. Never invent motion, weather, lighting or an action that is not on screen: a robot standing still is NOT "powering up", a bright room is NOT "a smoggy dawn skyline".',
       'Return JSON only, no markdown, in this exact shape:',
       '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
       'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
       'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
+      'LITERAL ONLY: describe ONLY what is literally visible/audible in the frames at that moment — a still object, a cutaway or a memory/flashback is just that. Never invent motion, weather, time of day, or a power-up/awakening that is not actually on screen. If a beat cross-cuts between places, say so and list what each cut actually shows.',
       'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.' + (firstNonBlackSec !== null ? ` The video fades in from black; the first real picture is at about ${firstNonBlackSec}s — the first beat must start at or after ${firstNonBlackSec}s.` : ''),
       'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
       `Video duration is ${Math.round(duration)} seconds.`,
@@ -324,10 +326,12 @@ async function analyzeVideoWithFiles(videoPath, firstNonBlackSec = null) {
                   text: [
                     'Watch AND listen to this video (picture and sound/dialogue).',
                     'Do NOT invent a plot from the filename. Describe only what you can see and hear.',
+                    'Describe ONLY what is literally visible and audible — what people and robots actually DO, in plain words. Never invent motion, weather, lighting or an action that is not on screen: a robot standing still is NOT "powering up", a bright room is NOT "a smoggy dawn skyline".',
                     'Return JSON only, no markdown, in this exact shape:',
                     '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
                     'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
                     'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
+                    'LITERAL ONLY: describe ONLY what is literally visible/audible at that moment — a still object, a cutaway or a memory/flashback is just that. Never invent motion, weather, time of day, or a power-up/awakening that is not actually on screen. If a beat cross-cuts between places, say so and list what each cut actually shows.',
                     'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.' + (firstNonBlackSec !== null ? ` The video fades in from black; the first real picture is at about ${firstNonBlackSec}s — the first beat must start at or after ${firstNonBlackSec}s.` : ''),
                     'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
                     `Video duration is ${Math.round(duration)} seconds.`,
@@ -375,6 +379,45 @@ async function analyzeVideoAuto(videoPath, framesDir) {
 }
 
 /**
+ * The style model: a REAL narration from Recappian Myanmar 2.0 (Real Steel
+ * recap, first ~3 min, auto-captions cleaned). The user caught that my
+ * hand-written rules produced WRITTEN prose — long dense sentences stuffed
+ * with adjectives ("dim flickering light, dark cold lab") — while the real
+ * narrator uses SHORT sentences, one or two facts each, plain everyday
+ * words, and never describes appearances. This example IS the style: Gemini
+ * copies its voice instead of following my rules. (2026-11-16: user said
+ * "Gemini ကို script ရေးခိုင်း" — let Gemini write the script.)
+ */
+const REAL_STYLE_EXAMPLE = [
+  'ချာလီက အကြွေးပတ်လည်ဝိုင်းနေတဲ့ စက်ရုပ်ဖိုက်တာ လောင်းကစားသမားတစ်ယောက်ဖြစ်ပါတယ်။',
+  'သူများတွေက စက်ရုပ်အချင်းချင်း ချနေချိန်မှာ သူ့စက်ရုပ်က နှစ်သိုးနဲ့ချရင် တစ်စီဖြစ်သွားပါတယ်။',
+  'အရင်အကြွေးတွေတောင်မကျေသေးခင် စက်ရုပ်ကပါ သုံးစားမရတော့တာကြောင့် ချာလီက လောင်ကြီးမပေးဘဲ လစ်ထွက်လာပါတယ်။',
+  'တစ်ခါလဲ သူခိုးထောင်ပြီး သတင်းဆိုးတစ်ခုက ထပ်ရောက်လာပြန်ပါတယ်။',
+  'သူနဲ့ကွဲနေတာကြာပြီဖြစ်တဲ့ မိန်းမက ဆုံးသွားပြီဖြစ်တာကြောင့် အသက်၁၁နှစ်အရွယ် သားကို အဖေဖြစ်တဲ့ ချာလီက အုပ်ထိန်းခွင့်ယူရမှာဖြစ်ပါတယ်။',
+  'ကလေးနာမည်က မက်စ်ဖြစ်ပြီး သူ့ရဲ့အဒေါ်က သူ့ကိုမွေးစားချင်နေပါတယ်။',
+  'ဒါပေမဲ့ အမေက သေတန်းစာမချန်ခဲ့တဲ့အတွက် တရားဥပဒေအရ အဖေဖြစ်တဲ့ ချာလီပဲ စောင့်ရှောက်ခွင့်ရမှာဖြစ်ပါတယ်။',
+  'အဲ့ဒါကိုသိတဲ့ ချာလီက ဒေါ်လာ၁သိန်းပေးရင် အုပ်ထိန်းခွင့်ပေးမယ်လို့ ပြောပါတယ်။',
+  'မိန်းမ အလိုက်ချင်နေတဲ့ မှာလဲ သဘောတူလိုက်ပြီး လောလောဆယ်တော့ ခရီးသွားဖို့ရှိတာကြောင့် ဧည့်ရပ်တွေမှာ ကလေးကို ခဏကြည့်ပေးထားဖို့ ပြောပါတယ်။',
+  'ချာလီကလဲ လက်ခံလိုက်ပါတယ်။ အိမ်မရှိတဲ့ ချာလီက သွေးရည်းစားဘဲမှာ နေပါတယ်။',
+  'မာဘင်က ပိုက်ဆံပေးတာကို မက်သိသွားတော့ ကိုယ့်သားကိုယ်တောင် ရောင်းစားတဲ့အဖေဆိုပြီး မုန်နေပါတယ်။',
+  'ဂရုမစိုက်ဘဲ သူလိုချင်တဲ့ စက်ရုပ်ကို ဝယ်လိုက်ပါတယ်။ စက်ရုပ်နာမည်က နွိုင်စီဝိုင်းဖြစ်ပြီး လွန်ခဲ့တဲ့ ငါးနှစ်က ချန်ပီယံ စက်ရုပ်ဖြစ်ပါတယ်။',
+  'မက်ကလဲ စက်ရုပ်လက်ဝှေ့ပွဲတွေကို ကြိုက်တာကြောင့် နွိုင်စီဝိုင်းရဲ့ နိုင်ပွဲတွေအားလုံးကို သိနေပါတယ်။',
+  'ချာလီနဲ့ မက်တို့က စက်ရုပ်လက်ဝှေ့ပွဲကို သွားဖို့ ပြင်ဆင်ပါတယ်။ မက်ကလဲ မခေါ်တဲ့ကြားက အတင်းလိုက်သွားပါတယ်။',
+  'ပွဲကို ရောက်တော့ ချာလီက ပွဲသေးသေးတွေ မထိုးပဲ နာမည်ကြီး စက်ရုပ်တွေနဲ့ပဲ ထိုးချင်နေပါတယ်။',
+  'မက်က ပွဲသေးသေးတွေကနေ တဆင့်ခြင်း တက်သွားဖို့ ပြောပေမယ့် လုပ်ချင်ရာစုလုပ်တဲ့ ချာလီကတော့ အကြမ်းဆုံးကောင်နဲ့ ပွဲတည်လိုက်ပါတယ်။',
+  'အဲ့လိုနဲ့ ပွဲစတော့ နွိုင်စီဝိုင်းက အသာစီးရသလိုရှိပေမယ့် ချာလီက အသံစနစ်တွေကို ကြိုကြည့်မလာတာကြောင့် အခွင့်အရေးအရ လဲ မထိုးမိဘဲ တုံ့ဆိုင်းတုံ့ဆိုင်းဖြစ်နေပါတယ်။',
+  'အဲ့ဒါကြောင့်ပဲ တစ်ဖက်စက်ရုပ်က နွိုင်စီဝိုင်းကို ပယ်ပယ်နယ်နဲ့ ပြန်ဆော်ပါတယ်။',
+  'တရားမဝင် လက်ဝှေ့ပွဲဖြစ်လို့ စည်းမျဉ်းတွေလဲ မရှိတာကြောင့် လက်တစ်ဖက်ပါ ပြတ်သွားပါတယ်။',
+  'ချာလီကတော့ အခုချိန်ထိတောင် ဘာလုပ်ခံရမှန်းမသိဘဲ တိုင်ပတ်နေပါတယ်။',
+  'နောက်ဆုံးမှာ တော့ နွိုင်စီဝိုင်း ခေါင်းပျက်ပြီး ချာလီတို့ ရှုံးသွားပါတယ်။',
+  'အမှိုက်သက်သာဖြစ်သွားတဲ့ စက်ရုပ်မှာ အသုံးဝင်သေးတာဆိုလို့ အသံနဲ့ထိန်းချုပ်လို့ရတဲ့ စနစ်တစ်ခုပဲ ကျန်ပါတော့တယ်။',
+  'နောက်ထပ် စက်ရုပ်မဝယ်နိုင်တော့တဲ့ ချာလီက သူ့စက်ရုပ်ကို ပြင်ဖို့ စက်ရုပ်သင်္ချိုင်းမှာ အသုံးဝင်နိုင်မယ့် စက်ရုပ်အစိတ်အပိုင်းတွေ သွားရှာပါတယ်။',
+  'ကိုယ့်ကြောင့် ခိုးဝက်ဟိုးဟို တီးတိလိုက်ရှာရင်း မက်က ကမ်းမပေါ်ကနေ ပြုတ်ကျသွားပါတယ်။',
+  'ကံကောင်းပါပဲ စက်ရုပ်လက်တစ်ဖက်နဲ့ ညီပြီး တန်းလှမ်းဖြစ်နေချိန် ချာလီက ဆွဲတင်လိုက်ပါတယ်။',
+  'မက်က သူ့ကိုဆွဲထားတဲ့ စက်ရုပ်လက်ကနေ တူးကြည့်တော့ စက်ရုပ်တစ်ကိုယ်လုံး ရှိနေတာကို တွေ့လိုက်ရပါတယ်။',
+].join('\n');
+
+/**
  * Generate a Burmese scene-by-scene recap script from REAL scene summaries.
  * Returns { title, scenes: [{ sceneNumber, startSec, endSec, sourceStartSec, sourceEndSec, narrationMy }] }
  * sourceStartSec/sourceEndSec are the timestamps in the ORIGINAL video to cut
@@ -397,8 +440,11 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   // lengthMinutes — each scene's narration should fill its share.
   const targetSecPerScene = Math.round((lengthMinutes * 60) / sceneCount);
   const prompt = [
-    'You are the narrator of Recappian Myanmar 2.0 — the most popular Burmese recap channel (883K subs). Fast, dense, matter-of-fact storytelling. NOT a funny friend chatting, NOT a newsreader, and NEVER an old man (ဘိုးတော်) talking politely.',
-    'Write a gripping Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
+    'You are the narrator of Recappian Myanmar 2.0 — the most popular Burmese recap channel (883K subs).',
+    'Write the script the way the real narrator below writes it. Study this REAL narration first — its voice IS the style. Do not follow any other style description; copy this example:',
+    REAL_STYLE_EXAMPLE,
+    'How it sounds — do exactly this: SHORT sentences, one or two facts per sentence, then the next sentence. Plain everyday spoken words (သုံးစားမရတော့တာ, လစ်ထွက်လာပါတယ်, တိုင်ပတ်နေပါတယ်, အမှိုက်သက်သာ, ဂရုမစိုက်ဘဲ, အတင်းလိုက်သွားပါတယ်). NEVER pile up adjectives, NEVER describe how things look — no "dim flickering light", no "dark cold lab", no "blazing blue energy", no "meticulously examining". Just say WHAT HAPPENS, then what happens next. Chain sentences with ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး / နောက်ထပ် / ကံကောင်းပါပဲ / တစ်ခါလဲ. You are telling the story to a friend — NOT explaining it, NOT teaching it, NOT describing a picture.',
+    'Write a Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
     'Base the story ONLY on these real beats from the video — do not invent characters, twists or an ending that is not in the beats. Each beat is one short moment (30-60s) with exact timestamps:',
     summaryText,
@@ -410,15 +456,15 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
     '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the ပါတယ် register (e.g. ဖြစ်ပါတယ်, ပြောပါတယ်, လုပ်လိုက်ပါတယ်). Every scene\'s narration must END with ပါတယ် — never end with ပါတော့တယ် or တယ်.',
-    '  2. LONG, DENSE sentences — pack 4-7 events into one flowing sentence, chained with …ပြီး / …တော့ / …ကြောင့် / ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး. NEVER write short choppy one-event clauses — real recaps tell fast and dense, one sentence covers a whole chain of events.',
+    '  2. SHORT sentences — one or two facts per sentence, like the real example above. NEVER write one long dense sentence packed with 4-7 events and adjectives. If a scene needs 40 seconds of narration, write MORE short sentences — do NOT make the sentences longer.',
     '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro, no hook question. Start with the premise and run.',
     '  4. NEVER address the viewer directly — no နော် / ပါဦး / လေး to the viewer, no questions to the viewer, no "keep watching" lines. Just tell the story.',
-    '  5. Dramatise the turning point: name the weakness, the counter-move, the decisive action — one vivid verb per beat. Describe feelings through reactions ("froze", "the crowd erupted", "kept getting back up"), never interior monologue.',
+    '  5. Say WHAT HAPPENS, never describe how it looks. Name the action and the reaction, in plain words — one vivid verb per beat. Never write a descriptive passage about light, colour, atmosphere or a place. Never explain why something matters; just say what happened next.',
     '  6. No forced jokes. If a moment is funny, say it straight — do not add a joke where the story has none.',
     '  7. Transliterate ALL foreign character/movie names into Burmese script (Charlie → ချာလီ, Max → မက်, Noisy Boy → နွိုင်စီဝိုင်း). NEVER leave English names in the narration.',
     '  8. Paraphrase dialogue as reported speech with …ဆိုပြီး / …လို့ (e.g. "ကိုယ့်သားကိုယ်တောင်ရောင်းစားတဲ့အဖေဆိုပြီး မုန်နေပါတယ်"). Quote at most one short punchline in the whole recap.',
     '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside its own clip range (sourceStartSec–sourceEndSec) — and IN TIME ORDER: walk through the range\'s moments from first to last, one clause per moment, exactly as they appear on screen. Never jump ahead to a later moment, never invent, never repeat another scene\'s event. If the range shows a bridge argument, say ONLY the bridge argument; if it shows a lab, say ONLY the lab.',
-    '  10. LENGTH: each scene\'s narration must last about as long as its clip range (range seconds x 20 Burmese characters of short clauses) — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. A narration much shorter than its range means the moments at the END of the range are never seen or heard — fill the range in order, adding more moments, reactions and comments until the scene is full. Too short is a failure.',
+    '  10. LENGTH: each scene\'s narration must last about as long as its clip range — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. Roughly 15 Burmese characters = 1 spoken second. Fill the range with MORE short sentences, in time order, adding more moments, reactions and comments until the scene is full. NEVER make sentences longer to fill time. A narration much shorter than its range means the moments at the END of the range are never seen or heard — too short is a failure.',
     '  11. End the LAST scene with the story\'s closing beat. No subscribe call, no closing line to the viewer — the story ends when the story ends.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
@@ -485,7 +531,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   });
   if (short.length > 0) {
     const expandPrompt = [
-      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 20 Burmese characters per second). Keep the same clip range and the same style: no ဗျာ/ဗျ ever, no literary သည်/များ/၏/၌, long dense sentences (4-7 events per sentence, chained with ပြီး/တော့/ကြောင့်/ဒါပေမဲ့/အဲ့ဒါကြောင့်), ပါတယ် endings, transliterated names, in time order over the range\'s moments, and describe ONLY what happens inside the range.',
+      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 15 Burmese characters per second). Keep the same clip range and the same style: SHORT sentences, one or two facts per sentence, plain everyday spoken words — never pile up adjectives, never describe how things look, just say what happens next; no ဗျာ/ဗျ ever, no literary သည်/များ/၏/၌, ပါတယ် endings, transliterated names, in time order over the range\'s moments, and describe ONLY what happens inside the range. Add MORE short sentences to fill the time — never make the sentences longer.',
       'Return JSON only, no markdown: {"scenes":[{"sceneNumber":1,"narrationMy":"..."}]}',
       ...short.map(
         (s) =>

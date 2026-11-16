@@ -427,6 +427,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   const ai = getClient();
   if (![5, 10, 15, 30, 60].includes(lengthMinutes)) {
     throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15, 30 or 60 minutes.`);
+  }
   // ONE SCENE PER BEAT — every analysed beat becomes a scene. The model
     // kept "picking" beats and dropping turning points (the orange laser grid
     // 190-235s was dropped twice, in the lite run AND the 3.8-flash run), so

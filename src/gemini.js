@@ -214,8 +214,9 @@ async function analyzeVideo(videoPath, framesDir) {
       'These are real frames, in time order, from the uploaded video.',
       'Do NOT invent a plot from the filename. Describe only what you can see in these frames.',
       'Return JSON only, no markdown, in this exact shape:',
-      '{"beats":[{"startSec":0,"endSec":45,"description":"exactly what is seen and heard in this beat, in English, 1-2 sentences"}]}',
+      '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
       'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
+      'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
       'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.',
       'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
       `Video duration is ${Math.round(duration)} seconds.`,
@@ -239,6 +240,9 @@ async function analyzeVideo(videoPath, framesDir) {
     startSec: Number(s.startSec) || 0,
     endSec: Number(s.endSec) || 0,
     description: String(s.description || '').trim(),
+    moments: (Array.isArray(s.moments) ? s.moments : [])
+      .map((m) => ({ atSec: Number(m.atSec) || 0, what: String(m.what || '').trim() }))
+      .filter((m) => m.what),
   }));
 }
 
@@ -303,8 +307,9 @@ async function analyzeVideoWithFiles(videoPath) {
                     'Watch AND listen to this video (picture and sound/dialogue).',
                     'Do NOT invent a plot from the filename. Describe only what you can see and hear.',
                     'Return JSON only, no markdown, in this exact shape:',
-                    '{"beats":[{"startSec":0,"endSec":45,"description":"exactly what is seen and heard in this beat, in English, 1-2 sentences"}]}',
+                    '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
                     'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
+                    'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
                     'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.',
                     'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
                     `Video duration is ${Math.round(duration)} seconds.`,
@@ -325,6 +330,9 @@ async function analyzeVideoWithFiles(videoPath) {
       startSec: Number(s.startSec) || 0,
       endSec: Number(s.endSec) || 0,
       description: String(s.description || '').trim(),
+      moments: (Array.isArray(s.moments) ? s.moments : [])
+        .map((m) => ({ atSec: Number(m.atSec) || 0, what: String(m.what || '').trim() }))
+        .filter((m) => m.what),
     }));
   } finally {
     try {
@@ -359,7 +367,10 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   }
   const sceneCount = SCENE_COUNT_BY_MINUTES[lengthMinutes];
   const summaryText = sceneSummaries
-    .map((s) => `${s.startSec}s-${s.endSec}s: ${s.description}`)
+    .map((s) => {
+      const moments = (s.moments || []).map((m) => `  ${m.atSec}s: ${m.what}`).join('\n');
+      return `${s.startSec}s-${s.endSec}s: ${s.description}${moments ? '\n' + moments : ''}`;
+    })
     .join('\n');
 
   // Target narration length: the finished recap must actually last about
@@ -375,7 +386,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
     '- ONE SCENE PER BEAT: pick ' + sceneCount + ' beats in story order (skip the dull ones, keep the turning points). Each scene uses ONE beat only — never merge two beats into one scene, never split a beat, never widen a window.',
-    '- "sourceStartSec"/"sourceEndSec" must be EXACTLY the chosen beat\'s startSec/endSec — copy the numbers, do not round or adjust them. The clip cut from those timestamps is what the viewer sees while this narration plays, so the words and the picture must show the SAME thing at the SAME time.',
+    '- CLIP RANGE, NOT THE WHOLE BEAT: "sourceStartSec"/"sourceEndSec" must be the exact timestamps of the moments this scene\'s narration actually describes — a contiguous range INSIDE its beat. If the beat is 50-95s but the narration is only about the brain examination at 80-95s, the scene\'s window is 80-95s, NOT 50-95s. The viewer only ever sees this range while the narration plays, so the words and the picture show the SAME thing at the SAME time.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
     '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. If a line contains သည်/များ/၏/၌ it will sound like written text read aloud.',
@@ -386,8 +397,8 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '  6. Be a funny friend watching with the viewer: joke or comment at the villain\'s or the scary scene\'s expense at least once where it fits.',
     '  7. Keep foreign character/movie names in English (never translate a name); gloss concepts in Burmese. Write English names phonetically only if they must be spoken in Burmese script.',
     '  8. Paraphrase dialogue; quote at most one short punchline in the whole recap.',
-    '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside that scene\'s own beat (its sourceStartSec–sourceEndSec) — never jump ahead to a later beat, never invent, never repeat another scene\'s event. If the beat shows a bridge argument, say ONLY the bridge argument; if it shows a lab, say ONLY the lab. The clip and the words must show the SAME thing.',
-    '  10. LENGTH: each scene\'s narration must last about as long as its beat (roughly the beat\'s seconds x 20 Burmese characters of short clauses) — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. A narration much longer than its beat will play over the NEXT scene\'s picture; a much shorter one leaves dead air. Too short is a failure — add more beats, reactions and comments until the scene is full.',
+    '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside its own clip range (sourceStartSec–sourceEndSec) — and IN TIME ORDER: walk through the range\'s moments from first to last, one clause per moment, exactly as they appear on screen. Never jump ahead to a later moment, never invent, never repeat another scene\'s event. If the range shows a bridge argument, say ONLY the bridge argument; if it shows a lab, say ONLY the lab.',
+    '  10. LENGTH: each scene\'s narration must last about as long as its clip range (range seconds x 20 Burmese characters of short clauses) — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. A narration much shorter than its range means the moments at the END of the range are never seen or heard — fill the range in order, adding more moments, reactions and comments until the scene is full. Too short is a failure.',
     '  11. End the LAST scene with a soft closing line inviting viewers to keep watching / subscribe to the little channel, with နော် / ပါဦး.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
@@ -406,11 +417,12 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   const parsed = parseJsonResponse(text, 'Burmese script');
   const scenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
   if (scenes.length === 0) throw new Error('Gemini script generation returned no scenes.');
-  // Snap every scene's window to the single beat it overlaps most. The model
-  // sometimes returns a window spanning several beats (e.g. 105-255s) — then
-  // the render only shows the first ~47s while the narration describes the
-  // whole 150s, so words and picture diverge. Snapping guarantees one scene
-  // = one beat = one continuous moment on screen.
+  // Clamp every scene's clip range inside the single beat it overlaps most.
+  // The model sometimes returns a window spanning several beats (e.g.
+  // 105-255s) — then the render only shows the first ~47s while the
+  // narration describes the whole 150s, so words and picture diverge.
+  // Clamping guarantees the clip stays inside one beat; the prompt asks the
+  // model to narrow the range to the moments it actually narrates.
   const snapped = scenes.map((s, i) => {
     const wStart = Number(s.sourceStartSec) || 0;
     const wEnd = Number(s.sourceEndSec) || 0;
@@ -423,8 +435,16 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
         best = b;
       }
     }
-    const startSec = best ? best.startSec : wStart;
-    const endSec = best ? best.endSec : wEnd;
+    let startSec = wStart;
+    let endSec = wEnd;
+    if (best) {
+      startSec = Math.max(wStart, best.startSec);
+      endSec = Math.min(wEnd, best.endSec);
+      if (endSec <= startSec) {
+        startSec = best.startSec;
+        endSec = best.endSec;
+      }
+    }
     return {
       sceneNumber: Number(s.sceneNumber) || i + 1,
       startSec,
@@ -434,6 +454,47 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
       narrationMy: String(s.narrationMy || '').trim(),
     };
   });
+  // Length enforcement: a narration much shorter than its clip range means
+  // the range's late moments are never seen or heard (job 6ace4f81 scene 2:
+  // 29s of narration over a 45s range — the brain it described sat in the
+  // trimmed-off tail and never appeared). Spoken Burmese runs ~20 chars/sec;
+  // expand any scene under 80% of its range with ONE extra call.
+  const short = snapped.filter((s) => {
+    const rangeLen = Math.max(1, s.endSec - s.startSec);
+    return s.narrationMy.length / 20 < 0.8 * rangeLen;
+  });
+  if (short.length > 0) {
+    const expandPrompt = [
+      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 20 Burmese characters per second). Keep the same clip range, the same spoken style (zero literary သည်/များ/၏/၌, one event per clause, in time order over the range\'s moments), and describe ONLY what happens inside the range.',
+      'Return JSON only, no markdown: {"scenes":[{"sceneNumber":1,"narrationMy":"..."}]}',
+      ...short.map(
+        (s) =>
+          `Scene ${s.sceneNumber}: clip ${s.startSec}s-${s.endSec}s (target ~${Math.round(s.endSec - s.startSec)}s spoken). Current narration (${Math.round(s.narrationMy.length / 20)}s): ${s.narrationMy}`
+      ),
+    ].join('\n');
+    try {
+      const expResponse = await withRetry(
+        () =>
+          ai.models.generateContent({
+            model: SCRIPT_MODEL,
+            contents: expandPrompt,
+            config: { responseMimeType: 'application/json' },
+          }),
+        'script expansion'
+      );
+      const expParsed = parseJsonResponse(expResponse.text || '', 'script expansion');
+      const expanded = Array.isArray(expParsed.scenes) ? expParsed.scenes : [];
+      for (const e of expanded) {
+        const target = snapped.find((s) => s.sceneNumber === (Number(e.sceneNumber) || 0));
+        if (target && String(e.narrationMy || '').trim()) {
+          target.narrationMy = String(e.narrationMy).trim();
+        }
+      }
+      console.log(`[script] expanded ${expanded.length} short scene(s) to fill their clip ranges`);
+    } catch (err) {
+      console.log(`[script] expansion failed (${String(err.message).slice(0, 120)}) — keeping original narrations`);
+    }
+  }
   return {
     title: String(parsed.title || '').trim() || 'မြန်မာ Recap',
     scenes: snapped,

@@ -104,6 +104,17 @@ const SCRIPT_MODEL = process.env.SCRIPT_MODEL || ANALYSIS_MODEL;
 // AND listens, so dialogue-driven scenes are no longer missed, and there is
 // no frame-extraction step at all). 'files' falls back to 'frames' on error.
 const ANALYSIS_MODE = process.env.ANALYSIS_MODE || 'frames';
+// MOMENT_CUT: '1' = moment-level cutting (user direction 2026-11-16 20:07:
+// "if the narration says the boy and the girl walk on the bridge, the video
+// MUST show them walking at that moment"). Each scene's narration is split
+// into one segment per sentence, each segment cut from the exact moment its
+// sentence describes — narration moment = picture moment, cut by cut.
+// Default off: scene-level rendering (current proven path) is unchanged.
+// When on, script returns segments, TTS splits audio per segment (two-level
+// silence split, scene first then sentence), and render cuts per segment.
+// Any failure at any level falls back to the scene-level path — a bad
+// moment split never fails the job.
+const MOMENT_CUT = process.env.MOMENT_CUT === '1';
 const TTS_MODELS = (process.env.TTS_MODELS || process.env.TTS_MODEL || 'gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts')
   .split(',')
   .map((s) => s.trim())
@@ -429,10 +440,10 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15, 30 or 60 minutes.`);
   }
   // ONE SCENE PER BEAT — every analysed beat becomes a scene. The model
-    // kept "picking" beats and dropping turning points (the orange laser grid
-    // 190-235s was dropped twice, in the lite run AND the 3.8-flash run), so
-    // selection is no longer the model's choice. Scene count = beat count.
-    const sceneCount = sceneSummaries.length;
+  // kept "picking" beats and dropping turning points (the orange laser grid
+  // 190-235s was dropped twice, in the lite run AND the 3.8-flash run), so
+  // selection is no longer the model's choice. Scene count = beat count.
+  const sceneCount = sceneSummaries.length;
   const summaryText = sceneSummaries
     .map((s) => {
       const moments = (s.moments || []).map((m) => `  ${m.atSec}s: ${m.what}`).join('\n');
@@ -454,6 +465,9 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     summaryText,
     'Requirements (return JSON only, no markdown):',
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
+    (MOMENT_CUT
+      ? '- MOMENT CUTTING — each scene ALSO returns "segments": one segment per sentence of its narration, in time order: {"segments":[{"text":"...","sourceStartSec":80,"sourceEndSec":95}]}. Each segment is ONE short sentence (1-2 facts) and its window is the EXACT moment that sentence describes: it MUST start at that moment\'s timestamp from the beats (e.g. the bridge walk starts when they step onto the bridge, not at the beat start), and end where the next sentence\'s moment starts (or at the beat end for the last one). Window length must roughly match the sentence when spoken (~15 Burmese characters = 1 second, minimum 4s). NEVER give two sentences the same window, NEVER let a segment\'s window show a different moment than its sentence describes. If the narration says the boy and the girl walk on the bridge, that segment\'s window MUST show them walking on the bridge. "narrationMy" must be exactly the segments\' texts joined in order.'
+      : ''),
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
     '- ONE SCENE PER BEAT: use EVERY beat below — one scene per beat, in story order. NEVER skip a beat, NEVER drop a beat because it looks dull, NEVER merge two beats into one scene, never split a beat, never widen a window. Every beat is a scene; the scene count is ' + sceneCount + ' because there are ' + sceneCount + ' beats.',
     '- CLIP RANGE, NOT THE WHOLE BEAT: "sourceStartSec"/"sourceEndSec" must be the exact timestamps of the moments this scene\'s narration actually describes — a contiguous range INSIDE its beat. If the beat is 50-95s but the narration is only about the brain examination at 80-95s, the scene\'s window is 80-95s, NOT 50-95s. The viewer only ever sees this range while the narration plays, so the words and the picture show the SAME thing at the SAME time.',
@@ -515,13 +529,55 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
         endSec = best.endSec;
       }
     }
+    // MOMENT_CUT: normalise the model's per-sentence segments — clamp each
+    // inside the scene's beat, sort in time order, de-overlap, and size each
+    // window to its sentence (~15 chars/sec, min 4s) so the window is never
+    // shorter than the sentence it carries. A window shorter than its
+    // sentence is what makes the renderer show the NEXT moment early.
+    // Invalid segments (empty text, bad window) drop the whole scene back
+    // to scene-level rendering — never fail the job over a bad segment.
+    let segments = null;
+    if (MOMENT_CUT && Array.isArray(s.segments) && s.segments.length > 0) {
+      const raw = s.segments
+        .map((g) => ({
+          text: String((g && g.text) || '').trim(),
+          sourceStartSec: Number((g && g.sourceStartSec) || 0),
+          sourceEndSec: Number((g && g.sourceEndSec) || 0),
+        }))
+        .filter((g) => g.text && g.sourceEndSec > g.sourceStartSec)
+        .sort((a, b) => a.sourceStartSec - b.sourceStartSec);
+      const norm = [];
+      for (const g of raw) {
+        let a = best ? Math.max(g.sourceStartSec, best.startSec) : g.sourceStartSec;
+        let b = best ? Math.min(g.sourceEndSec, best.endSec) : g.sourceEndSec;
+        if (b <= a) {
+          a = best ? best.startSec : g.sourceStartSec;
+          b = best ? best.endSec : g.sourceEndSec;
+        }
+        if (b <= a) continue;
+        const estSec = Math.max(4, g.text.length / 15);
+        if (b - a < estSec) b = Math.min(best ? best.endSec : a + estSec, a + estSec);
+        if (b <= a) continue;
+        if (norm.length > 0 && a < norm[norm.length - 1].sourceEndSec) {
+          a = norm[norm.length - 1].sourceEndSec;
+          if (b <= a) continue;
+        }
+        norm.push({ text: g.text, sourceStartSec: a, sourceEndSec: b });
+      }
+      // One segment = the scene itself; keep the scene path (an extra split
+      // boundary would only add failure modes for zero benefit).
+      if (norm.length > 1) segments = norm;
+    }
     return {
       sceneNumber: Number(s.sceneNumber) || i + 1,
       startSec,
       endSec,
       sourceStartSec: startSec,
       sourceEndSec: endSec,
-      narrationMy: String(s.narrationMy || '').trim(),
+      narrationMy: segments
+        ? segments.map((g) => g.text).join(' ')
+        : String(s.narrationMy || '').trim(),
+      ...(segments ? { segments } : {}),
     };
   });
   // Length enforcement: a narration much shorter than its clip range means
@@ -530,6 +586,10 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   // trimmed-off tail and never appeared). Spoken Burmese runs ~20 chars/sec;
   // expand any scene under 80% of its range with ONE extra call.
   const short = snapped.filter((s) => {
+    // Moment-cut scenes are exempt: their windows are already sized to
+    // their sentences by the normalisation above, so expanding the text
+    // would break the sentence↔window alignment the segments carry.
+    if (s.segments) return false;
     const rangeLen = Math.max(1, s.endSec - s.startSec);
     return s.narrationMy.length / 20 < 0.8 * rangeLen;
   });
@@ -703,11 +763,16 @@ async function generateAllSceneAudio(scenes, audioDir, voiceName = DEFAULT_TTS_V
 }
 
 /**
- * Split one MP3 into N segments at the silences between scenes.
+ * Split one MP3 into N segments at the silences between units (scenes, or
+ * sentences inside one scene for moment-level cutting).
  * Returns [{ path, durationSec }] or null when the split is not trustworthy
  * (too few silences, or a segment shorter than 0.5s) — the caller then
  * falls back to per-scene TTS instead of shipping a bad split.
  *
+ * opts.toleranceSec: how far a detected silence may sit from its expected
+ * boundary (default max(3, 20% of the file) — the proven scene-level value;
+ * sentence-level splits pass a tighter value, since a scene slice is short
+ * and its boundaries are close together). opts.outPrefix names the pieces.
  * Why the first version failed on real audio (job 55046916, 2026-11-15):
  * it required silences of >=1.0s and picked the N-1 LONGEST ones. The
  * <long pause> tag's real duration is model-controlled and unproven — if it
@@ -720,8 +785,9 @@ async function generateAllSceneAudio(scenes, audioDir, voiceName = DEFAULT_TTS_V
  * longer be mistaken for a scene boundary, and every decision is logged
  * so the next failure is diagnosable from the Railway logs.
  */
-async function splitAudioBySilence(wholeMp3, scenes, workDir) {
-  const sceneCount = scenes.length;
+async function splitAudioBySilence(wholeMp3, units, workDir, opts = {}) {
+  const unitCount = units.length;
+  const unitText = (u) => String(u.text || u.narrationMy || '').trim();
   const totalSec = await ffprobeDuration(wholeMp3);
   if (!totalSec || totalSec <= 0) return null;
   let stderr = '';
@@ -753,18 +819,18 @@ async function splitAudioBySilence(wholeMp3, scenes, workDir) {
     `[gemini] silencedetect: ${silences.length} silences >=0.5s in ${totalSec.toFixed(1)}s audio: ` +
       silences.map((s) => `${s.start.toFixed(1)}-${s.end.toFixed(1)}s`).join(', ')
   );
-  const needed = sceneCount - 1;
+  const needed = unitCount - 1;
   if (silences.length < needed) {
     console.log(`[gemini] split failed: need ${needed} boundaries, found ${silences.length} silences`);
     return null;
   }
   // Expected boundary times from narration lengths, scaled to the real total.
-  const est = scenes.map((s) => Math.max(3, (s.narrationMy || '').length / 20));
+  const est = units.map((u) => Math.max(3, unitText(u).length / 20));
   const estTotal = est.reduce((a, b) => a + b, 0);
   const scale = totalSec / estTotal;
   const expected = [];
   let cum = 0;
-  for (let i = 0; i < sceneCount - 1; i++) {
+  for (let i = 0; i < unitCount - 1; i++) {
     cum += est[i] * scale;
     expected.push(cum);
   }
@@ -782,7 +848,7 @@ async function splitAudioBySilence(wholeMp3, scenes, workDir) {
         best = i;
       }
     }
-    const tolerance = Math.max(3, 0.2 * totalSec);
+    const tolerance = opts.toleranceSec ?? Math.max(3, 0.2 * totalSec);
     if (best === null || bestDist > tolerance) {
       console.log(
         `[gemini] split failed: no silence near expected boundary ${exp.toFixed(1)}s (nearest ${bestDist.toFixed(1)}s away, tolerance ${tolerance.toFixed(1)}s)`
@@ -798,9 +864,8 @@ async function splitAudioBySilence(wholeMp3, scenes, workDir) {
   );
   const cuts = [0, ...boundaries, totalSec];
   const segments = [];
-  for (let i = 0; i < sceneCount; i++) {
-    const num = scenes[i].sceneNumber || i + 1;
-    const out = path.join(workDir, `scene_${num}.mp3`);
+  for (let i = 0; i < unitCount; i++) {
+    const out = path.join(workDir, `${opts.outPrefix || 'scene'}_${String(i + 1).padStart(2, '0')}.mp3`);
     // -ss/-to BEFORE -i are input options: absolute timestamps in the file.
     await execFileAsync('ffmpeg', [
       '-y', '-ss', String(cuts[i]), '-to', String(cuts[i + 1]),
@@ -850,7 +915,17 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
   const out = [];
   for (let c = 0; c < chunks.length; c++) {
     const chunk = chunks[c];
-    const joined = chunk.map((s) => s.narrationMy).join('\n<long pause>\n');
+    // Moment-level cutting: the TTS text is every SENTENCE (one <long pause>
+    // between each), still ONE Gemini call per chunk — quota cost unchanged.
+    // The audio is then split in two levels: scenes first (proven), then
+    // sentences inside each scene slice (short file, tight tolerance).
+    // Either level failing drops that scene back to scene-level audio —
+    // a bad moment split never fails the job.
+    const momentMode =
+      MOMENT_CUT && chunk.every((s) => Array.isArray(s.segments) && s.segments.length > 1);
+    const joined = momentMode
+      ? chunk.flatMap((s) => s.segments.map((g) => g.text)).join('\n<long pause>\n')
+      : chunk.map((s) => s.narrationMy).join('\n<long pause>\n');
     const wholeMp3 = path.join(audioDir, `whole_${c}.mp3`);
     const wavPath = path.join(audioDir, `whole_${c}.wav`);
     const buffer = await generateTtsAudioBuffer(
@@ -861,15 +936,46 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
     audioBufferToWav(buffer, wavPath);
     await execFileAsync('ffmpeg', ['-y', '-i', wavPath, '-codec:a', 'libmp3lame', '-q:a', '4', wholeMp3]);
     fs.unlinkSync(wavPath);
-    const segments = await splitAudioBySilence(wholeMp3, chunk, audioDir);
+    const segments = await splitAudioBySilence(wholeMp3, chunk, audioDir, {
+      outPrefix: `chunk${c}-scene`,
+    });
     if (!segments) {
       console.log(`[gemini] batched split failed for chunk ${c + 1} — falling back to per-scene TTS for its ${chunk.length} scenes`);
       const fallback = await generateAllSceneAudio(chunk, audioDir, voiceName);
-      out.push(...fallback);
-    } else {
+      // Fallback audio is scene-level: drop segments so render uses it.
+      out.push(...fallback.map((s) => {
+        const { segments: _dropped, ...rest } = s;
+        return rest;
+      }));
+    } else if (!momentMode) {
       chunk.forEach((scene, i) =>
         out.push({ ...scene, audioPath: segments[i].path, audioDurationSec: segments[i].durationSec })
       );
+    } else {
+      for (let i = 0; i < chunk.length; i++) {
+        const scene = chunk[i];
+        const slice = segments[i];
+        const segSplit = await splitAudioBySilence(slice.path, scene.segments, audioDir, {
+          toleranceSec: Math.max(1.5, 0.08 * slice.durationSec),
+          outPrefix: `chunk${c}-s${i + 1}-seg`,
+        });
+        if (!segSplit) {
+          console.log(`[gemini] sentence split failed for scene ${scene.sceneNumber} — keeping scene-level audio for that scene`);
+          const { segments: _dropped, ...rest } = scene;
+          out.push({ ...rest, audioPath: slice.path, audioDurationSec: slice.durationSec });
+        } else {
+          out.push({
+            ...scene,
+            audioPath: slice.path,
+            audioDurationSec: slice.durationSec,
+            segments: scene.segments.map((g, j) => ({
+              ...g,
+              audioPath: segSplit[j].path,
+              audioDurationSec: segSplit[j].durationSec,
+            })),
+          });
+        }
+      }
     }
     try {
       fs.unlinkSync(wholeMp3);
@@ -880,6 +986,7 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
 
 module.exports = {
   ANALYSIS_MODEL,
+  MOMENT_CUT,
   SCRIPT_MODEL,
   TTS_MODEL,
   TTS_MODELS,

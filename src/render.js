@@ -145,6 +145,9 @@ async function renderSceneSegmentFast({ sourceVideo, sourceStartSec, audioDurati
  * Any failure also returns null via the caller's try/catch — never throws.
  */
 async function renderRecapFast({ sourceVideo, scenes, workDir, out720, out480 }) {
+  // Moment-cut scenes render per segment (tempo per sentence) — the fast
+  // path only knows scene-level stream-copy cuts, so it stays out.
+  if (scenes.some((s) => Array.isArray(s.segments) && s.segments.some((g) => g.audioPath))) return null;
   const streams = await ffprobeStreams(sourceVideo);
   const v = streams.find((s) => s.codec_type === 'video');
   if (!v || v.codec_name !== 'h264' || v.height !== 720) return null;
@@ -240,6 +243,32 @@ async function renderRecap({ sourceVideo, scenes, workDir, out720, out480 }) {
   const segmentPaths = [];
   for (let i = 0; i < scenes.length; i++) {
     const s = scenes[i];
+    // Moment-level cutting: one sub-segment per sentence, each cut from
+    // the exact moment its sentence describes (sourceStartSec is that
+    // moment's timestamp, not the scene start). The sub-segments concat in
+    // order, so narration moment = picture moment, cut by cut. A scene
+    // whose sentence split failed has no segment audio and renders whole,
+    // exactly as before.
+    const momentSegs = Array.isArray(s.segments)
+      ? s.segments.filter((g) => g.audioPath && fs.existsSync(g.audioPath))
+      : [];
+    if (momentSegs.length > 1 && momentSegs.length === s.segments.length) {
+      for (let j = 0; j < momentSegs.length; j++) {
+        const g = momentSegs[j];
+        const audioDur = g.audioDurationSec || (await ffprobeDuration(g.audioPath));
+        const seg = path.join(segDir, `scene-${String(i + 1).padStart(2, '0')}-seg${String(j + 1).padStart(2, '0')}.mp4`);
+        await renderSceneSegment({
+          sourceVideo,
+          sourceStartSec: g.sourceStartSec ?? 0,
+          sourceEndSec: g.sourceEndSec ?? (g.sourceStartSec ?? 0) + audioDur,
+          audioPath: g.audioPath,
+          audioDurationSec: audioDur,
+          outPath: seg,
+        });
+        segmentPaths.push(seg);
+      }
+      continue;
+    }
     if (!s.audioPath || !fs.existsSync(s.audioPath)) {
       throw new Error(`renderRecap: scene ${i + 1} has no audio file — refusing to render a silent recap.`);
     }

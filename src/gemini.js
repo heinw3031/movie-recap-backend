@@ -214,8 +214,10 @@ async function analyzeVideo(videoPath, framesDir) {
       'These are real frames, in time order, from the uploaded video.',
       'Do NOT invent a plot from the filename. Describe only what you can see in these frames.',
       'Return JSON only, no markdown, in this exact shape:',
-      '{"scenes":[{"startSec":0,"endSec":90,"description":"what happens in this stretch, in English, 1-2 sentences"}]}',
-      'Cover the whole video from 0s to the end, in chronological order. Merge similar stretches; aim for 6-15 scenes.',
+      '{"beats":[{"startSec":0,"endSec":45,"description":"exactly what is seen and heard in this beat, in English, 1-2 sentences"}]}',
+      'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
+      'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.',
+      'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
       `Video duration is ${Math.round(duration)} seconds.`,
     ].join('\n'),
   });
@@ -231,8 +233,8 @@ async function analyzeVideo(videoPath, framesDir) {
   const text = response.text;
   if (!text) throw new Error('Gemini analysis returned no text.');
   const parsed = parseJsonResponse(text, 'video analysis');
-  const scenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
-  if (scenes.length === 0) throw new Error('Gemini analysis returned no scenes.');
+  const scenes = Array.isArray(parsed.beats) ? parsed.beats : parsed.scenes;
+  if (!Array.isArray(scenes) || scenes.length === 0) throw new Error('Gemini analysis returned no scenes.');
   return scenes.map((s) => ({
     startSec: Number(s.startSec) || 0,
     endSec: Number(s.endSec) || 0,
@@ -240,7 +242,7 @@ async function analyzeVideo(videoPath, framesDir) {
   }));
 }
 
-const SCENE_COUNT_BY_MINUTES = { 5: 7, 10: 13, 15: 20, 30: 38 };
+const SCENE_COUNT_BY_MINUTES = { 5: 7, 10: 13, 15: 20, 30: 38, 60: 76 };
 
 function mimeTypeForVideo(filePath) {
   const ext = path.extname(filePath).toLowerCase();
@@ -301,8 +303,10 @@ async function analyzeVideoWithFiles(videoPath) {
                     'Watch AND listen to this video (picture and sound/dialogue).',
                     'Do NOT invent a plot from the filename. Describe only what you can see and hear.',
                     'Return JSON only, no markdown, in this exact shape:',
-                    '{"scenes":[{"startSec":0,"endSec":90,"description":"what happens in this stretch, in English, 1-2 sentences"}]}',
-                    'Cover the whole video from 0s to the end, in chronological order. Merge similar stretches; aim for 6-15 scenes.',
+                    '{"beats":[{"startSec":0,"endSec":45,"description":"exactly what is seen and heard in this beat, in English, 1-2 sentences"}]}',
+                    'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
+                    'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.',
+                    'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
                     `Video duration is ${Math.round(duration)} seconds.`,
                   ].join('\n'),
                 },
@@ -315,8 +319,8 @@ async function analyzeVideoWithFiles(videoPath) {
     const text = response.text;
     if (!text) throw new Error('Gemini Files API analysis returned no text.');
     const parsed = parseJsonResponse(text, 'video analysis (Files API)');
-    const scenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
-    if (scenes.length === 0) throw new Error('Gemini Files API analysis returned no scenes.');
+    const scenes = Array.isArray(parsed.beats) ? parsed.beats : parsed.scenes;
+    if (!Array.isArray(scenes) || scenes.length === 0) throw new Error('Gemini Files API analysis returned no scenes.');
     return scenes.map((s) => ({
       startSec: Number(s.startSec) || 0,
       endSec: Number(s.endSec) || 0,
@@ -350,8 +354,8 @@ async function analyzeVideoAuto(videoPath, framesDir) {
  */
 async function generateScript({ sceneSummaries, lengthMinutes, category, fileName }) {
   const ai = getClient();
-  if (![5, 10, 15, 30].includes(lengthMinutes)) {
-    throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15 or 30 minutes.`);
+  if (![5, 10, 15, 30, 60].includes(lengthMinutes)) {
+    throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15, 30 or 60 minutes.`);
   }
   const sceneCount = SCENE_COUNT_BY_MINUTES[lengthMinutes];
   const summaryText = sceneSummaries
@@ -365,12 +369,13 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     'You are a Myanmar movie-recap narrator in the style of the most popular Burmese recap channels (Recappian Myanmar 2.0, TV Myanmar Recap "Kwee") — a funny friend telling the story out loud to friends, NOT a newsreader reading an essay.',
     'Write a gripping Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
-    'Base the story ONLY on these real scene summaries from the video — do not invent characters, twists or an ending that is not in the summaries:',
+    'Base the story ONLY on these real beats from the video — do not invent characters, twists or an ending that is not in the beats. Each beat is one short moment (30-60s) with exact timestamps:',
     summaryText,
     'Requirements (return JSON only, no markdown):',
-    '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":90,"narrationMy":"..."}]}',
+    '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
-    '- "sourceStartSec"/"sourceEndSec" must be real timestamps from the summaries above, so the clip cut from the source video matches this scene.',
+    '- ONE SCENE PER BEAT: pick ' + sceneCount + ' beats in story order (skip the dull ones, keep the turning points). Each scene uses ONE beat only — never merge two beats into one scene, never split a beat, never widen a window.',
+    '- "sourceStartSec"/"sourceEndSec" must be EXACTLY the chosen beat\'s startSec/endSec — copy the numbers, do not round or adjust them. The clip cut from those timestamps is what the viewer sees while this narration plays, so the words and the picture must show the SAME thing at the SAME time.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
     '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. If a line contains သည်/များ/၏/၌ it will sound like written text read aloud.',
@@ -381,8 +386,8 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '  6. Be a funny friend watching with the viewer: joke or comment at the villain\'s or the scary scene\'s expense at least once where it fits.',
     '  7. Keep foreign character/movie names in English (never translate a name); gloss concepts in Burmese. Write English names phonetically only if they must be spoken in Burmese script.',
     '  8. Paraphrase dialogue; quote at most one short punchline in the whole recap.',
-    '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside that scene\'s own sourceStartSec–sourceEndSec window — never jump ahead, never invent, never repeat another scene\'s event. The clip cut from that window and the words over it must show the SAME thing.',
-    '  10. LENGTH: each scene\'s narration must last about ' + targetSecPerScene + ' seconds when spoken (roughly ' + targetSecPerScene * 20 + ' Burmese characters of short clauses), so the whole recap lasts about ' + lengthMinutes + ' minutes. Too short is a failure — add more beats, reactions and comments until the scene is full.',
+    '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside that scene\'s own beat (its sourceStartSec–sourceEndSec) — never jump ahead to a later beat, never invent, never repeat another scene\'s event. If the beat shows a bridge argument, say ONLY the bridge argument; if it shows a lab, say ONLY the lab. The clip and the words must show the SAME thing.',
+    '  10. LENGTH: each scene\'s narration must last about as long as its beat (roughly the beat\'s seconds x 20 Burmese characters of short clauses) — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. A narration much longer than its beat will play over the NEXT scene\'s picture; a much shorter one leaves dead air. Too short is a failure — add more beats, reactions and comments until the scene is full.',
     '  11. End the LAST scene with a soft closing line inviting viewers to keep watching / subscribe to the little channel, with နော် / ပါဦး.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
@@ -401,16 +406,37 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   const parsed = parseJsonResponse(text, 'Burmese script');
   const scenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
   if (scenes.length === 0) throw new Error('Gemini script generation returned no scenes.');
+  // Snap every scene's window to the single beat it overlaps most. The model
+  // sometimes returns a window spanning several beats (e.g. 105-255s) — then
+  // the render only shows the first ~47s while the narration describes the
+  // whole 150s, so words and picture diverge. Snapping guarantees one scene
+  // = one beat = one continuous moment on screen.
+  const snapped = scenes.map((s, i) => {
+    const wStart = Number(s.sourceStartSec) || 0;
+    const wEnd = Number(s.sourceEndSec) || 0;
+    let best = null;
+    let bestOverlap = -1;
+    for (const b of sceneSummaries) {
+      const overlap = Math.max(0, Math.min(wEnd, b.endSec) - Math.max(wStart, b.startSec));
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = b;
+      }
+    }
+    const startSec = best ? best.startSec : wStart;
+    const endSec = best ? best.endSec : wEnd;
+    return {
+      sceneNumber: Number(s.sceneNumber) || i + 1,
+      startSec,
+      endSec,
+      sourceStartSec: startSec,
+      sourceEndSec: endSec,
+      narrationMy: String(s.narrationMy || '').trim(),
+    };
+  });
   return {
     title: String(parsed.title || '').trim() || 'မြန်မာ Recap',
-    scenes: scenes.map((s, i) => ({
-      sceneNumber: Number(s.sceneNumber) || i + 1,
-      startSec: Number(s.sourceStartSec) || 0,
-      endSec: Number(s.sourceEndSec) || 0,
-      sourceStartSec: Number(s.sourceStartSec) || 0,
-      sourceEndSec: Number(s.sourceEndSec) || 0,
-      narrationMy: String(s.narrationMy || '').trim(),
-    })),
+    scenes: snapped,
   };
 }
 

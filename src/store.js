@@ -37,6 +37,15 @@ function publicJob(job) {
     title: job.title || null,
     scenes: job.scenes || [],
     sceneSummaries: job.sceneSummaries || [],
+    // Moment verification (2026-11-17): counts from gemini.verifyMoments,
+    // stored in runAnalysis. momentsVerification is 'verified' | 'skipped'
+    // (flag off / no moments) | 'failed' (all groups errored — the job
+    // continued with unverified moments).
+    momentsTotal: job.momentsTotal ?? null,
+    momentsVerified: job.momentsVerified ?? null,
+    momentsCorrected: job.momentsCorrected ?? null,
+    momentsDropped: job.momentsDropped ?? null,
+    momentsVerification: job.momentsVerification || null,
     sourceDurationSec: job.sourceDurationSec ?? null,
     audioDurations: job.audioDurations || {},
     finalVideoUrl: job.finalVideoUrl || null,

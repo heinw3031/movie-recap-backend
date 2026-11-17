@@ -115,6 +115,35 @@ const ANALYSIS_MODE = process.env.ANALYSIS_MODE || 'frames';
 // Any failure at any level falls back to the scene-level path — a bad
 // moment split never fails the job.
 const MOMENT_CUT = process.env.MOMENT_CUT === '1';
+// VERIFY_MOMENTS: '0' = off, anything else (including unset) = ON.
+// Moment verification (2026-11-17): the analysis model's moments are
+// sometimes mis-grounded — the timestamp does not show what the moment
+// claims (job 6b70028f, 3.8-flash analysis: @98s "holographic cables and
+// power conduits pulse with light" but the source frame at 98s is a
+// sniper-scope view of a flying war robot over rooftops; @432s "Celia
+// releases Thom, her projection dissolves" but the frame is Barley aiming
+// a rifle on a rooftop; 3.6-flash did the same: @259s "officer puts hand
+// on Thom's shoulder" over an empty street). The renderer is proven
+// correct (output frames are pixel-identical to the source at the scene's
+// timestamps) and the narration faithfully follows the moments, so the
+// fault is the moments themselves — verification anchors the narration to
+// moments PROVEN to be in the footage. A focused yes/no about one frame
+// is far easier for the model than generating correct timestamps in the
+// first place. A moment that fails is DROPPED (its sentence is dropped
+// too, by the existing skip rule); a moment whose event is visible nearby
+// is MOVED to the correct timestamp. Default ON: the live test needs it.
+// Set VERIFY_MOMENTS=0 in Railway to switch it off without a code
+// redeploy. Any verification failure falls back to the unverified moments
+// — a bad verification never fails the job.
+// Quota: up to MOMENTS_PER_VERIFY_CALL moments are batched into ONE
+// generateContent call (one inline image per moment + its claim), grouped
+// by script chunk (40 beats). A 5-min test (~50 beats, ~100 moments)
+// costs ~3 verification calls; a 30-min test (~500 beats, ~700 moments)
+// costs ~18 on top of ~13 script + ~13 expansion calls, so a long recap
+// may exceed one project's 20/day — switch it off for long recaps if
+// quota is the binding constraint.
+const VERIFY_MOMENTS = process.env.VERIFY_MOMENTS !== '0';
+const MOMENTS_PER_VERIFY_CALL = 40;
 const TTS_MODELS = (process.env.TTS_MODELS || process.env.TTS_MODEL || 'gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts')
   .split(',')
   .map((s) => s.trim())
@@ -387,6 +416,299 @@ async function analyzeVideoAuto(videoPath, framesDir) {
     }
   }
   return analyzeVideo(videoPath, framesDir, firstNonBlackSec);
+}
+
+/**
+ * Extract the single frame at `atSec` from a video, downscaled to 320px
+ * wide (small enough to send 40 of them in one vision call, big enough to
+ * recognise what is on screen). Returns the JPEG path. Input `-ss` seeks
+ * to the nearest keyframe then decodes forward, so the returned frame is
+ * the frame AT atSec, not just the nearest keyframe.
+ */
+async function extractMomentFrame(videoPath, atSec, outPath) {
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  await execFileAsync('ffmpeg', [
+    '-y', '-ss', String(atSec), '-i', videoPath,
+    '-vframes', '1',
+    '-vf', 'scale=320:-1,format=yuvj420p',
+    '-q:v', '3',
+    outPath,
+  ]);
+  if (!fs.existsSync(outPath)) {
+    throw new Error(`extractMomentFrame: no frame at ${atSec}s in ${videoPath}`);
+  }
+  return outPath;
+}
+
+/**
+ * Ask Gemini (vision, ANALYSIS_MODEL) to verify one group of moments.
+ * `group` is [{ id, atSec, what, framePath }] — one inline image per
+ * moment, each followed by its claim, so the model can attribute every
+ * verdict to the right frame. Returns the verdicts array (possibly empty
+ * on a bad response — the caller treats missing verdicts as unverified).
+ * One call per group, never one call per moment.
+ */
+async function verifyMomentGroupWithModel(ai, group) {
+  const parts = [];
+  for (const m of group) {
+    parts.push({
+      inlineData: {
+        mimeType: 'image/jpeg',
+        data: fs.readFileSync(m.framePath).toString('base64'),
+      },
+    });
+    parts.push({ text: `Moment ${m.id} @${m.atSec}s: "${m.what}"` });
+  }
+  parts.push({
+    text: [
+      'These are real frames from one video, each followed by a claim about what that frame shows.',
+      'For EACH moment, look at its frame and judge ONLY that frame against its claim.',
+      'Return JSON only, no markdown, in this exact shape:',
+      '{"verdicts":[{"id":0,"confirmed":true},{"id":1,"confirmed":false,"actual":"a sniper-scope view of a flying war robot over rooftops","correctedAtSec":null}]}',
+      'Rules:',
+      '- "confirmed": true ONLY if the frame CLEARLY shows the claimed event or action. Be strict: a similar place, a similar person, or the same scene a few seconds off does NOT count.',
+      '- If not confirmed, "actual" is one short clause describing what the frame ACTUALLY shows (in English, what is literally visible).',
+      '- If the claimed event IS visible at a different timestamp nearby (within a few seconds), set "correctedAtSec" to that timestamp (a number, in seconds). Otherwise set it to null. Never guess a timestamp you cannot see.',
+      '- If you are unsure, say confirmed:false with actual describing the frame — never confirm on a guess.',
+      '- Return one verdict per moment id, in the same order as the moments above. Do not add moments, do not drop any.',
+    ].join('\n'),
+  });
+  const response = await withRetry(
+    () =>
+      ai.models.generateContent({
+        model: ANALYSIS_MODEL,
+        contents: [{ parts }],
+        config: { responseMimeType: 'application/json' },
+      }),
+    'moment verification'
+  );
+  const text = response.text;
+  if (!text) return [];
+  const parsed = parseJsonResponse(text, 'moment verification');
+  if (Array.isArray(parsed.verdicts)) return parsed.verdicts;
+  if (Array.isArray(parsed.results)) return parsed.results;
+  return [];
+}
+
+/**
+ * Apply verification verdicts to a set of beats (pure — no I/O, testable).
+ * `moments` is the flat list [{ id, beatIndex, momentIndex, atSec, what }]
+ * built by verifyMoments; `verdicts` is the model's verdict array.
+ * Returns { beats, stats, events } where beats is a NEW array (the
+ * original is untouched):
+ *  - confirmed: the moment is kept as-is.
+ *  - rejected with a correctedAtSec inside its own beat (±5s, clamped
+ *    into the beat): the moment is MOVED to the corrected timestamp and
+ *    keeps its `what` (the event description was right, the timestamp was
+ *    wrong).
+ *  - rejected without a usable correction: the moment is DROPPED.
+ *  - no verdict for a moment: the moment is KEPT (unverified — a bad or
+ *    incomplete verification must never gut the script).
+ * A correction outside its own beat is treated as no correction (dropped):
+ * moving a moment across beats would shuffle the story, and the event is
+ * usually already covered by the neighbouring beat's moments.
+ * `events` lists the dropped/corrected moments (for the console log).
+ */
+function applyVerdicts(beats, moments, verdicts) {
+  const byId = new Map();
+  for (const v of Array.isArray(verdicts) ? verdicts : []) {
+    const id = Number(v && v.id);
+    if (Number.isFinite(id) && !byId.has(id)) byId.set(id, v);
+  }
+  const stats = { total: moments.length, verified: 0, corrected: 0, dropped: 0, unverified: 0 };
+  const events = [];
+  const correctedAt = new Map(); // moment id -> new atSec
+  const droppedIds = new Set();
+  for (const m of moments) {
+    const v = byId.get(m.id);
+    if (!v) {
+      stats.unverified++;
+      continue;
+    }
+    if (v.confirmed === true) {
+      stats.verified++;
+      continue;
+    }
+    const beat = beats[m.beatIndex];
+    const corr = Number(v.correctedAtSec);
+    const inBeat =
+      beat &&
+      Number.isFinite(corr) &&
+      corr >= 0 &&
+      corr >= beat.startSec - 5 &&
+      corr <= beat.endSec + 5 &&
+      corr !== m.atSec;
+    if (inBeat) {
+      const clamped = Math.max(beat.startSec, Math.min(beat.endSec, corr));
+      correctedAt.set(m.id, clamped);
+      stats.corrected++;
+      events.push({ id: m.id, atSec: m.atSec, what: m.what, outcome: 'corrected', actual: String(v.actual || ''), correctedAtSec: clamped });
+    } else {
+      droppedIds.add(m.id);
+      stats.dropped++;
+      events.push({ id: m.id, atSec: m.atSec, what: m.what, outcome: 'dropped', actual: String(v.actual || ''), correctedAtSec: null });
+    }
+  }
+  // Rebuild each beat's moments from the flat list, so a dropped moment
+  // disappears and a corrected moment moves — the beat's other fields
+  // (description, range) are untouched. Kept moments are re-sorted into
+  // time order: a corrected moment can otherwise sit after a later one.
+  const byBeatMoment = new Map();
+  for (const m of moments) byBeatMoment.set(`${m.beatIndex}:${m.momentIndex}`, m);
+  const newBeats = beats.map((b, bi) => {
+    const kept = [];
+    (b.moments || []).forEach((m, mi) => {
+      const flat = byBeatMoment.get(`${bi}:${mi}`);
+      if (!flat) {
+        kept.push(m);
+        return;
+      }
+      if (droppedIds.has(flat.id)) return;
+      if (correctedAt.has(flat.id)) {
+        kept.push({ atSec: correctedAt.get(flat.id), what: String(m.what || '').trim() });
+      } else {
+        kept.push(m);
+      }
+    });
+    kept.sort((a, b) => a.atSec - b.atSec);
+    return { ...b, moments: kept };
+  });
+  return { beats: newBeats, stats, events };
+}
+
+/**
+ * Verify every analysis moment against its ACTUAL video frame, and return
+ * beats whose moments are only the verified ones.
+ *
+ * Flow: collect all moments (global ids, beat order) -> group them by
+ * script chunk (40 beats) and split into <= MOMENTS_PER_VERIFY_CALL per
+ * model call -> for each group, extract the real frame at each moment's
+ * timestamp and ask Gemini (vision) to confirm the claim -> apply the
+ * verdicts (confirm / correct / drop / keep-if-no-verdict).
+ *
+ * Returns { beats, stats } where stats is
+ * { total, verified, corrected, dropped, unverified, calls, enabled,
+ *   status } and status is 'verified' | 'skipped' | 'failed'.
+ * On ANY failure (frame extraction, model call, bad JSON, unexpected
+ * error) the ORIGINAL beats are returned and the job continues with
+ * unverified moments — verification never fails the job and never drops
+ * a moment it could not check.
+ *
+ * opts (all optional, for tests):
+ *  - enabled: default VERIFY_MOMENTS (env).
+ *  - maxMomentsPerCall: default MOMENTS_PER_VERIFY_CALL.
+ *  - chunkBeats: default SCRIPT_CHUNK_BEATS (grouping aligns with the
+ *    script chunks so one chunk's moments are verified together).
+ *  - frameProvider(videoPath, atSec, outPath): default
+ *    extractMomentFrame. Tests inject a stub that writes a fake frame.
+ *  - modelFn(group): default the real Gemini call. Tests inject a mock
+ *    that returns verdicts without calling Gemini. The group passed to
+ *    modelFn is [{ id, atSec, what, framePath, beatIndex }].
+ */
+async function verifyMoments(beats, videoPath, workDir, opts = {}) {
+  const enabled = opts.enabled !== undefined ? opts.enabled : VERIFY_MOMENTS;
+  const maxPerCall = opts.maxMomentsPerCall || MOMENTS_PER_VERIFY_CALL;
+  const chunkBeats = opts.chunkBeats || SCRIPT_CHUNK_BEATS;
+  const frameProvider = opts.frameProvider || extractMomentFrame;
+  const modelFn = opts.modelFn || null;
+  const baseStats = { total: 0, verified: 0, corrected: 0, dropped: 0, unverified: 0, calls: 0, enabled, status: 'skipped' };
+  if (!enabled) return { beats, stats: baseStats };
+  if (!Array.isArray(beats) || beats.length === 0) return { beats, stats: baseStats };
+
+  // Flat moment list, in beat order, with global ids.
+  const moments = [];
+  beats.forEach((b, bi) => {
+    (b.moments || []).forEach((m, mi) => {
+      const what = String(m.what || '').trim();
+      if (!what) return;
+      moments.push({ id: moments.length, beatIndex: bi, momentIndex: mi, atSec: Number(m.atSec) || 0, what });
+    });
+  });
+  if (moments.length === 0) {
+    return { beats, stats: { ...baseStats, status: 'verified' } };
+  }
+  baseStats.total = moments.length;
+
+  // Group moments: never split one beat across calls, never cross a
+  // script-chunk boundary (40 beats — the same split as
+  // splitBeatsIntoChunks), at most maxPerCall per call.
+  const groups = [];
+  let cur = [];
+  let curChunk = 0;
+  const byBeat = new Map();
+  for (const m of moments) {
+    if (!byBeat.has(m.beatIndex)) byBeat.set(m.beatIndex, []);
+    byBeat.get(m.beatIndex).push(m);
+  }
+  beats.forEach((b, bi) => {
+    const bMoments = byBeat.get(bi) || [];
+    if (bMoments.length === 0) return;
+    const bChunk = Math.floor(bi / chunkBeats);
+    if (cur.length > 0 && (bChunk !== curChunk || cur.length + bMoments.length > maxPerCall)) {
+      groups.push(cur);
+      cur = [];
+    }
+    curChunk = bChunk;
+    cur.push(...bMoments);
+  });
+  if (cur.length > 0) groups.push(cur);
+
+  const frameDir = workDir;
+  let allVerdicts = [];
+  let calls = 0;
+  let failedGroups = 0;
+  try {
+    fs.mkdirSync(frameDir, { recursive: true });
+    for (let gi = 0; gi < groups.length; gi++) {
+      const group = groups[gi];
+      // Extract the real frame at each moment's timestamp. A moment whose
+      // frame cannot be extracted is left unverified (kept) — never
+      // dropped on an ffmpeg error.
+      const withFrames = [];
+      for (const m of group) {
+        const outPath = path.join(frameDir, `m${m.id}.jpg`);
+        try {
+          await frameProvider(videoPath, m.atSec, outPath);
+          withFrames.push({ ...m, framePath: outPath });
+        } catch (e) {
+          console.log(`[verify] frame extraction failed for moment ${m.id} @${m.atSec}s (${String(e.message).slice(0, 100)}) — keeping it unverified`);
+        }
+      }
+      if (withFrames.length === 0) {
+        failedGroups++;
+        continue;
+      }
+      try {
+        calls++;
+        let verdicts;
+        if (modelFn) {
+          verdicts = await modelFn(withFrames);
+        } else {
+          verdicts = await verifyMomentGroupWithModel(getClient(), withFrames);
+        }
+        if (Array.isArray(verdicts)) allVerdicts.push(...verdicts);
+      } catch (e) {
+        failedGroups++;
+        console.log(`[verify] group ${gi + 1}/${groups.length} failed (${String(e.message).slice(0, 120)}) — keeping its ${withFrames.length} moment(s) unverified`);
+      }
+    }
+    const { beats: newBeats, stats, events } = applyVerdicts(beats, moments, allVerdicts);
+    stats.calls = calls;
+    stats.enabled = enabled;
+    stats.status = failedGroups === groups.length && groups.length > 0 ? 'failed' : 'verified';
+    for (const ev of events) {
+      console.log(`[verify] moment ${ev.id} @${ev.atSec}s ${ev.outcome}${ev.outcome === 'corrected' ? ` -> ${ev.correctedAtSec}s` : ''}: "${ev.what}" — frame shows: ${ev.actual || '(not reported)'}`);
+    }
+    console.log(`[verify] ${stats.verified} verified, ${stats.corrected} corrected, ${stats.dropped} dropped, ${stats.unverified} unverified, ${calls} call(s), status ${stats.status}`);
+    return { beats: newBeats, stats };
+  } catch (err) {
+    console.log(`[verify] verification failed (${String(err.message).slice(0, 160)}) — continuing with unverified moments`);
+    return { beats, stats: { ...baseStats, unverified: moments.length, status: 'failed' } };
+  } finally {
+    try {
+      fs.rmSync(frameDir, { recursive: true, force: true });
+    } catch (_) {}
+  }
 }
 
 /**
@@ -1169,6 +1491,8 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
 module.exports = {
   ANALYSIS_MODEL,
   MOMENT_CUT,
+  VERIFY_MOMENTS,
+  MOMENTS_PER_VERIFY_CALL,
   SCRIPT_MODEL,
   SCRIPT_CHUNK_BEATS,
   TTS_MODEL,
@@ -1177,9 +1501,12 @@ module.exports = {
   requireApiKey,
   ffprobeDuration,
   extractFrames,
+  extractMomentFrame,
   analyzeVideo,
   analyzeVideoWithFiles,
   analyzeVideoAuto,
+  verifyMoments,
+  applyVerdicts,
   generateScript,
   generateScriptChunk,
   splitBeatsIntoChunks,

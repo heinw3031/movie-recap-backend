@@ -35,11 +35,34 @@ async function runAnalysis(jobId) {
     setStage(jobId, 'analysing', 10);
     const framesDir = path.join(dir, 'frames');
     const summaries = await gemini.analyzeVideoAuto(job.sourcePath, framesDir);
-    store.updateJob(jobId, { sceneSummaries: summaries });
+    // Moment verification (2026-11-17): anchor the narration to moments
+    // PROVEN to be in the footage — see gemini.verifyMoments. Any failure
+    // falls back to the unverified summaries; the job never fails here.
+    // The verified summaries are what the script is written from, so the
+    // script prompt and buildSegmentsFromMoments only ever see verified
+    // moments. Counts are stored on the job record for tests/diagnosis.
+    let verified = {
+      beats: summaries,
+      stats: { total: 0, verified: 0, corrected: 0, dropped: 0, unverified: 0, calls: 0, enabled: false, status: 'skipped' },
+    };
+    try {
+      verified = await gemini.verifyMoments(summaries, job.sourcePath, path.join(dir, 'verify'));
+    } catch (err) {
+      console.log(`[job ${jobId}] moment verification failed (${String(err.message).slice(0, 120)}) — continuing with unverified moments`);
+    }
+    console.log(`[job ${jobId}] moments: ${verified.stats.verified} verified, ${verified.stats.corrected} corrected, ${verified.stats.dropped} dropped, ${verified.stats.unverified} unverified (${verified.stats.calls} verification call(s), ${verified.stats.status})`);
+    store.updateJob(jobId, {
+      sceneSummaries: verified.beats,
+      momentsTotal: verified.stats.total,
+      momentsVerified: verified.stats.verified,
+      momentsCorrected: verified.stats.corrected,
+      momentsDropped: verified.stats.dropped,
+      momentsVerification: verified.stats.status,
+    });
     setStage(jobId, 'scripting', 30);
 
     const script = await gemini.generateScript({
-      sceneSummaries: summaries,
+      sceneSummaries: verified.beats,
       lengthMinutes: job.lengthMinutes,
       category: job.category,
       fileName: job.originalName,

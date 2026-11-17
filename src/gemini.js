@@ -244,9 +244,9 @@ async function analyzeVideo(videoPath, framesDir, firstNonBlackSec = null) {
       'Do NOT invent a plot from the filename. Describe only what you can see in these frames.',
       'Describe ONLY what is literally visible — what people and robots actually DO, in plain words. Never invent motion, weather, lighting or an action that is not on screen: a robot standing still is NOT "powering up", a bright room is NOT "a smoggy dawn skyline".',
       'Return JSON only, no markdown, in this exact shape:',
-      '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
-      'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
-      'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
+      '{"beats":[{"startSec":0,"endSec":12,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":2,"what":"one short clause: what is seen/heard at this moment"},{"atSec":8,"what":"..."}]}]}',
+      'BEATS, not chapters: split the video into short beats of 8-15 seconds each (about one beat per 10 seconds). Each beat is ONE micro-event — one thing happening, one place, one action — never a summary of several seconds, never several actions in one beat. One beat = one narration sentence.',
+      'Inside EVERY beat, list 1-2 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
       'LITERAL ONLY: describe ONLY what is literally visible/audible in the frames at that moment — a still object, a cutaway or a memory/flashback is just that. Never invent motion, weather, time of day, or a power-up/awakening that is not actually on screen. If a beat cross-cuts between places, say so and list what each cut actually shows.',
       'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.' + (firstNonBlackSec !== null ? ` The video fades in from black; the first real picture is at about ${firstNonBlackSec}s — the first beat must start at or after ${firstNonBlackSec}s.` : ''),
       'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
@@ -339,9 +339,9 @@ async function analyzeVideoWithFiles(videoPath, firstNonBlackSec = null) {
                     'Do NOT invent a plot from the filename. Describe only what you can see and hear.',
                     'Describe ONLY what is literally visible and audible — what people and robots actually DO, in plain words. Never invent motion, weather, lighting or an action that is not on screen: a robot standing still is NOT "powering up", a bright room is NOT "a smoggy dawn skyline".',
                     'Return JSON only, no markdown, in this exact shape:',
-                    '{"beats":[{"startSec":0,"endSec":45,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":5,"what":"one short clause: what is seen/heard at this moment"},{"atSec":20,"what":"..."},{"atSec":38,"what":"..."}]}]}',
-                    'BEATS, not chapters: split the video into short beats of 30-60 seconds each (about one beat per 45 seconds). Each beat is ONE continuous moment — one place, one action — never a summary of several minutes.',
-                    'Inside EVERY beat, list 2-4 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
+                    '{"beats":[{"startSec":0,"endSec":12,"description":"what this beat is about, in English, 1-2 sentences","moments":[{"atSec":2,"what":"one short clause: what is seen/heard at this moment"},{"atSec":8,"what":"..."}]}]}',
+                    'BEATS, not chapters: split the video into short beats of 8-15 seconds each (about one beat per 10 seconds). Each beat is ONE micro-event — one thing happening, one place, one action — never a summary of several seconds, never several actions in one beat. One beat = one narration sentence.',
+                    'Inside EVERY beat, list 1-2 key moments in time order with their approximate timestamp (atSec) and one short clause each (what is actually seen or heard at that exact moment). Moments are the ground truth the narration will be timed against — be precise, never invent a moment.',
                     'LITERAL ONLY: describe ONLY what is literally visible/audible at that moment — a still object, a cutaway or a memory/flashback is just that. Never invent motion, weather, time of day, or a power-up/awakening that is not actually on screen. If a beat cross-cuts between places, say so and list what each cut actually shows.',
                     'Skip pure black screens, fade-ins, fade-outs and end credits entirely — no beat may be mostly black, and the first beat starts when the picture actually begins.' + (firstNonBlackSec !== null ? ` The video fades in from black; the first real picture is at about ${firstNonBlackSec}s — the first beat must start at or after ${firstNonBlackSec}s.` : ''),
                     'Cover the whole video from the first real picture to the end, in chronological order, beats back-to-back with no gaps.',
@@ -429,16 +429,165 @@ const REAL_STYLE_EXAMPLE = [
 ].join('\n');
 
 /**
+ * Beat-lock helpers (2026-11-17, YouTube recap study: one sentence = one
+ * story beat, ~5-10s; the picture always shows that same beat, 22/22
+ * samples). The script model ignores prompt-only structural instructions
+ * (job b27e7aa3: whole-beat ranges, ~12s narrations for 45-90s ranges,
+ * zero segments), so alignment is enforced in CODE from the analysis
+ * moments — the timestamped ground truth — not by asking the model.
+ */
+
+/** Split Burmese narration into sentences (terminator ။, also ! and ?). */
+function splitSentences(text) {
+  const parts = String(text || '').match(/[^။!?]+(?:[။!?]|$)/g) || [];
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+/**
+ * Normalise a list of per-sentence segments: clamp each window inside the
+ * scene's clip [clipStart, clipEnd], sort in time order, de-overlap, and
+ * size each window to its sentence (~15 chars/sec, min 4s) so the window
+ * is never shorter than the sentence it carries. A window shorter than its
+ * sentence is what makes the renderer show the NEXT moment early.
+ * Returns the normalised list (possibly empty) — the caller decides the
+ * minimum length that counts as moment-cutting.
+ */
+function normaliseSegments(raw, clipStart, clipEnd) {
+  const list = (Array.isArray(raw) ? raw : [])
+    .map((g) => ({
+      text: String((g && g.text) || '').trim(),
+      sourceStartSec: Number((g && g.sourceStartSec) || 0),
+      sourceEndSec: Number((g && g.sourceEndSec) || 0),
+    }))
+    .filter((g) => g.text && g.sourceEndSec > g.sourceStartSec)
+    .sort((a, b) => a.sourceStartSec - b.sourceStartSec);
+  const norm = [];
+  for (const g of list) {
+    let a = Math.max(g.sourceStartSec, clipStart);
+    let b = Math.min(g.sourceEndSec, clipEnd);
+    if (b <= a) {
+      a = clipStart;
+      b = clipEnd;
+    }
+    if (b <= a) continue;
+    const estSec = Math.max(4, g.text.length / 15);
+    if (b - a < estSec) b = Math.min(clipEnd, a + estSec);
+    if (b <= a) continue;
+    if (norm.length > 0 && a < norm[norm.length - 1].sourceEndSec) {
+      a = norm[norm.length - 1].sourceEndSec;
+      if (b <= a) continue;
+    }
+    norm.push({ text: g.text, sourceStartSec: a, sourceEndSec: b });
+  }
+  return norm;
+}
+
+/**
+ * Build a scene's per-sentence segments from its analysis beat's moments.
+ * Sentence i is assigned to moment i, in time order; window =
+ * [moment.atSec, next moment's atSec or clip end], extended to the
+ * sentence's spoken length. Moments outside the scene's clip are ignored
+ * (the narration describes only what is inside the clip). Sentences with
+ * no moment are DROPPED by the caller (see generateScriptChunk) — the
+ * returned segments' texts ARE the kept narration. Returns null when
+ * moment-cutting is impossible for this scene (fewer than 2 sentences or
+ * fewer than 2 moments inside the clip) — the scene then renders
+ * scene-level. One segment = the scene itself, so it is not kept (an
+ * extra split boundary would only add failure modes for zero benefit).
+ */
+function buildSegmentsFromMoments(sentences, beat, clipStart, clipEnd) {
+  if (!MOMENT_CUT || !Array.isArray(sentences) || sentences.length < 2) return null;
+  if (!beat || !Array.isArray(beat.moments)) return null;
+  const moments = beat.moments
+    .map((m) => ({ atSec: Number(m.atSec) || 0, what: String(m.what || '').trim() }))
+    .filter((m) => m.what && m.atSec >= clipStart && m.atSec < clipEnd)
+    .sort((a, b) => a.atSec - b.atSec);
+  if (moments.length < 2) return null;
+  const kept = sentences.slice(0, moments.length);
+  if (kept.length < 2) return null;
+  const raw = kept.map((text, i) => ({
+    text,
+    sourceStartSec: moments[i].atSec,
+    sourceEndSec: i + 1 < moments.length ? moments[i + 1].atSec : clipEnd,
+  }));
+  const norm = normaliseSegments(raw, clipStart, clipEnd);
+  return norm.length > 1 ? norm : null;
+}
+
+/**
+ * The model's own segments, used only as a hint when the beat has no
+ * usable moments to build from. Same normalisation as the code-built path.
+ * Returns null unless at least 2 valid segments survive.
+ */
+function normaliseModelSegments(modelSegments, clipStart, clipEnd) {
+  if (!MOMENT_CUT || !Array.isArray(modelSegments) || modelSegments.length === 0) return null;
+  const norm = normaliseSegments(modelSegments, clipStart, clipEnd);
+  return norm.length > 1 ? norm : null;
+}
+
+/**
+ * Drift flag for the job record: a scene whose narration is under half its
+ * clip range is at risk of showing the wrong picture (the renderer trims
+ * the clip to the narration, so late moments never appear). Moment-cut
+ * scenes are aligned per segment, so the scene-level comparison does not
+ * apply to them. Spoken Burmese runs ~20 chars/sec.
+ */
+function computeDriftRisk(narrationMy, startSec, endSec, hasSegments) {
+  if (hasSegments) return false;
+  const rangeLen = Math.max(1, endSec - startSec);
+  return (narrationMy || '').length / 20 < 0.5 * rangeLen;
+}
+
+/** True when a scene carries usable per-sentence segments. */
+function hasMomentSegments(scene) {
+  return MOMENT_CUT && Array.isArray(scene.segments) && scene.segments.length > 1;
+}
+
+/**
+ * TTS text units for one scene: its sentences when it is a moment scene,
+ * its whole narration otherwise. generateRecapAudio joins every scene's
+ * units with <long pause> in ONE call — moment mode is per-scene, so a
+ * scene without segments no longer disables moment-cutting for the chunk.
+ */
+function chunkTtsUnits(scene) {
+  if (hasMomentSegments(scene)) {
+    return scene.segments.map((g) => String(g.text || '').trim()).filter(Boolean);
+  }
+  const text = String(scene.narrationMy || '').trim();
+  return text ? [text] : [];
+}
+
+/**
  * Generate a Burmese scene-by-scene recap script from REAL scene summaries.
  * Returns { title, scenes: [{ sceneNumber, startSec, endSec, sourceStartSec, sourceEndSec, narrationMy }] }
  * sourceStartSec/sourceEndSec are the timestamps in the ORIGINAL video to cut
  * the clip from — this is what makes the later render match the narration.
  */
-async function generateScript({ sceneSummaries, lengthMinutes, category, fileName }) {
-  const ai = getClient();
-  if (![5, 10, 15, 30, 60].includes(lengthMinutes)) {
-    throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15, 30 or 60 minutes.`);
+// Script chunking (2026-11-17, beat-lock fix): a 30-min recap of an 82-min
+// film means ~200-300 short beats — too many for ONE script call (the
+// model drops beats and the JSON gets huge). Beats are split into groups
+// of ~40 and the script is generated per group, then concatenated in
+// order. A 5-min recap (~40-60 beats) is one or two groups; the path is
+// unchanged apart from the split. Beats are NEVER made long again to
+// solve scaling — that reintroduces the drift the short beats fixed.
+const SCRIPT_CHUNK_BEATS = 40;
+
+/** Split beats into consecutive groups of at most `chunkSize` (pure, testable). */
+function splitBeatsIntoChunks(sceneSummaries, chunkSize = SCRIPT_CHUNK_BEATS) {
+  const chunks = [];
+  for (let i = 0; i < sceneSummaries.length; i += chunkSize) {
+    chunks.push(sceneSummaries.slice(i, i + chunkSize));
   }
+  return chunks;
+}
+
+/**
+ * Generate the script for ONE chunk of beats (<= SCRIPT_CHUNK_BEATS).
+ * targetSecPerScene is computed from the TOTAL beat count by the wrapper,
+ * so the concatenated recap still lasts about lengthMinutes.
+ */
+async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fileName, targetSecPerScene, chunkIndex, totalChunks }) {
+  const ai = getClient();
   // ONE SCENE PER BEAT — every analysed beat becomes a scene. The model
   // kept "picking" beats and dropping turning points (the orange laser grid
   // 190-235s was dropped twice, in the lite run AND the 3.8-flash run), so
@@ -451,9 +600,6 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     })
     .join('\n');
 
-  // Target narration length: the finished recap must actually last about
-  // lengthMinutes — each scene's narration should fill its share.
-  const targetSecPerScene = Math.round((lengthMinutes * 60) / sceneCount);
   const prompt = [
     'You are the narrator of Recappian Myanmar 2.0 — the most popular Burmese recap channel (883K subs).',
     'Write the script the way the real narrator below writes it. Study this REAL narration first — its voice IS the style. Do not follow any other style description; copy this example:',
@@ -461,8 +607,11 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     'How it sounds — do exactly this: SHORT sentences, one or two facts per sentence, then the next sentence. Plain everyday spoken words (သုံးစားမရတော့တာ, လစ်ထွက်လာပါတယ်, တိုင်ပတ်နေပါတယ်, အမှိုက်သက်သာ, ဂရုမစိုက်ဘဲ, အတင်းလိုက်သွားပါတယ်). NEVER pile up adjectives, NEVER describe how things look — no "dim flickering light", no "dark cold lab", no "blazing blue energy", no "meticulously examining". Just say WHAT HAPPENS, then what happens next. Chain sentences with ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး / နောက်ထပ် / ကံကောင်းပါပဲ / တစ်ခါလဲ. You are telling the story to a friend — NOT explaining it, NOT teaching it, NOT describing a picture.',
     'Write a Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
-    'Base the story ONLY on these real beats from the video — do not invent characters, twists or an ending that is not in the beats. Each beat is one short moment (30-60s) with exact timestamps:',
+    'Base the story ONLY on these real beats from the video — do not invent characters, twists or an ending that is not in the beats. Each beat is one short moment (8-15s) with exact timestamps:',
     summaryText,
+    ...(totalChunks > 1
+      ? ['This is part ' + (chunkIndex + 1) + ' of ' + totalChunks + ' of one ' + lengthMinutes + '-minute recap — the beats below are one consecutive stretch of the full story. Write ONLY these beats, in story order; do not add an opening or a closing for the whole recap (the first part opens it, the last part closes it).']
+      : []),
     'Requirements (return JSON only, no markdown):',
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     (MOMENT_CUT
@@ -471,10 +620,11 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
     '- ONE SCENE PER BEAT: use EVERY beat below — one scene per beat, in story order. NEVER skip a beat, NEVER drop a beat because it looks dull, NEVER merge two beats into one scene, never split a beat, never widen a window. Every beat is a scene; the scene count is ' + sceneCount + ' because there are ' + sceneCount + ' beats.',
     '- CLIP RANGE, NOT THE WHOLE BEAT: "sourceStartSec"/"sourceEndSec" must be the exact timestamps of the moments this scene\'s narration actually describes — a contiguous range INSIDE its beat. If the beat is 50-95s but the narration is only about the brain examination at 80-95s, the scene\'s window is 80-95s, NOT 50-95s. The viewer only ever sees this range while the narration plays, so the words and the picture show the SAME thing at the SAME time.',
+    '- ONE SENTENCE = ONE BEAT. Never narrate a story point whose footage is not inside this scene\'s window — SKIP it instead of describing it over other footage. If the narrated action has no footage (a decision, a phone call), narrate it over the footage of the event it causes, and only if that footage is inside the window.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
     '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the ပါတယ် register (e.g. ဖြစ်ပါတယ်, ပြောပါတယ်, လုပ်လိုက်ပါတယ်). Every scene\'s narration must END with ပါတယ် — never end with ပါတော့တယ် or တယ်.',
-    '  2. SHORT sentences — one or two facts per sentence, like the real example above. NEVER write one long dense sentence packed with 4-7 events and adjectives. If a scene needs 40 seconds of narration, write MORE short sentences — do NOT make the sentences longer.',
+    '  2. SHORT sentences — one or two facts per sentence, like the real example above. NEVER write one long dense sentence packed with 4-7 events and adjectives. If a scene needs 10 seconds of narration, write MORE short sentences — do NOT make the sentences longer.',
     '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro, no hook question. Start with the premise and run.',
     '  4. NEVER address the viewer directly — no နော် / ပါဦး / လေး to the viewer, no questions to the viewer, no "keep watching" lines. Just tell the story.',
     '  5. Say WHAT HAPPENS, never describe how it looks. Name the action and the reaction, in plain words — one vivid verb per beat. Never write a descriptive passage about light, colour, atmosphere or a place. Never explain why something matters; just say what happened next.',
@@ -529,44 +679,27 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
         endSec = best.endSec;
       }
     }
-    // MOMENT_CUT: normalise the model's per-sentence segments — clamp each
-    // inside the scene's beat, sort in time order, de-overlap, and size each
-    // window to its sentence (~15 chars/sec, min 4s) so the window is never
-    // shorter than the sentence it carries. A window shorter than its
-    // sentence is what makes the renderer show the NEXT moment early.
-    // Invalid segments (empty text, bad window) drop the whole scene back
-    // to scene-level rendering — never fail the job over a bad segment.
-    let segments = null;
-    if (MOMENT_CUT && Array.isArray(s.segments) && s.segments.length > 0) {
-      const raw = s.segments
-        .map((g) => ({
-          text: String((g && g.text) || '').trim(),
-          sourceStartSec: Number((g && g.sourceStartSec) || 0),
-          sourceEndSec: Number((g && g.sourceEndSec) || 0),
-        }))
-        .filter((g) => g.text && g.sourceEndSec > g.sourceStartSec)
-        .sort((a, b) => a.sourceStartSec - b.sourceStartSec);
-      const norm = [];
-      for (const g of raw) {
-        let a = best ? Math.max(g.sourceStartSec, best.startSec) : g.sourceStartSec;
-        let b = best ? Math.min(g.sourceEndSec, best.endSec) : g.sourceEndSec;
-        if (b <= a) {
-          a = best ? best.startSec : g.sourceStartSec;
-          b = best ? best.endSec : g.sourceEndSec;
-        }
-        if (b <= a) continue;
-        const estSec = Math.max(4, g.text.length / 15);
-        if (b - a < estSec) b = Math.min(best ? best.endSec : a + estSec, a + estSec);
-        if (b <= a) continue;
-        if (norm.length > 0 && a < norm[norm.length - 1].sourceEndSec) {
-          a = norm[norm.length - 1].sourceEndSec;
-          if (b <= a) continue;
-        }
-        norm.push({ text: g.text, sourceStartSec: a, sourceEndSec: b });
+    // BEAT LOCK (2026-11-17, YouTube recap study): segments are built in
+    // CODE from the analysis beat's timestamped moments (ground truth) —
+    // the model (3.6-flash, job b27e7aa3) returned zero segments, so the
+    // render fell back to scene-level and the late moments never appeared.
+    // Sentence i is assigned to moment i, in time order (the prompt
+    // already requires time order). A sentence with no moment is DROPPED
+    // from the narration — narrating less, correctly, beats narrating more
+    // over the wrong picture (the real recaps' skip rule). The model's own
+    // segments are used only as a hint, when the beat has no usable moments.
+    const narrationRaw = String(s.narrationMy || '').trim();
+    const sentences = splitSentences(narrationRaw);
+    let segments = buildSegmentsFromMoments(sentences, best, startSec, endSec);
+    let narrationMy = narrationRaw;
+    if (segments) {
+      narrationMy = segments.map((g) => g.text).join(' ');
+    } else {
+      const hint = normaliseModelSegments(s.segments, startSec, endSec);
+      if (hint) {
+        segments = hint;
+        narrationMy = hint.map((g) => g.text).join(' ');
       }
-      // One segment = the scene itself; keep the scene path (an extra split
-      // boundary would only add failure modes for zero benefit).
-      if (norm.length > 1) segments = norm;
     }
     return {
       sceneNumber: Number(s.sceneNumber) || i + 1,
@@ -574,9 +707,7 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
       endSec,
       sourceStartSec: startSec,
       sourceEndSec: endSec,
-      narrationMy: segments
-        ? segments.map((g) => g.text).join(' ')
-        : String(s.narrationMy || '').trim(),
+      narrationMy,
       ...(segments ? { segments } : {}),
     };
   });
@@ -625,10 +756,56 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
       console.log(`[script] expansion failed (${String(err.message).slice(0, 120)}) — keeping original narrations`);
     }
   }
+  // Drift flag for the job record: a scene whose narration is under half
+  // its clip range is at risk of showing the wrong picture (the renderer
+  // trims the clip to the narration, so late moments never appear).
+  // Moment-cut scenes are aligned per segment, so they are never flagged.
+  // Computed AFTER expansion, so an expanded narration is judged on its
+  // final length.
+  for (const s of snapped) {
+    s.driftRisk = computeDriftRisk(s.narrationMy, s.startSec, s.endSec, Array.isArray(s.segments) && s.segments.length > 1);
+  }
   return {
     title: String(parsed.title || '').trim() || 'မြန်မာ Recap',
     scenes: snapped,
   };
+}
+
+/**
+ * Generate the full Burmese script, chunked by beats (see
+ * SCRIPT_CHUNK_BEATS). One scene per beat, scenes renumbered globally,
+ * title from the first chunk.
+ */
+async function generateScript({ sceneSummaries, lengthMinutes, category, fileName }) {
+  if (![5, 10, 15, 30, 60].includes(lengthMinutes)) {
+    throw new Error(`Unsupported recap length ${lengthMinutes}. Use 5, 10, 15, 30 or 60 minutes.`);
+  }
+  if (!Array.isArray(sceneSummaries) || sceneSummaries.length === 0) {
+    throw new Error('generateScript: no scene summaries — cannot write a script from nothing.');
+  }
+  // Target narration length: the finished recap must actually last about
+  // lengthMinutes — each scene's narration should fill its share. Computed
+  // from the TOTAL beat count so chunking does not change the per-scene target.
+  const targetSecPerScene = Math.round((lengthMinutes * 60) / sceneSummaries.length);
+  const chunks = splitBeatsIntoChunks(sceneSummaries);
+  let title = 'မြန်မာ Recap';
+  const allScenes = [];
+  for (let c = 0; c < chunks.length; c++) {
+    const part = await generateScriptChunk({
+      sceneSummaries: chunks[c],
+      lengthMinutes,
+      category,
+      fileName,
+      targetSecPerScene,
+      chunkIndex: c,
+      totalChunks: chunks.length,
+    });
+    if (c === 0 && part.title) title = part.title;
+    for (const s of part.scenes) {
+      allScenes.push({ ...s, sceneNumber: allScenes.length + 1 });
+    }
+  }
+  return { title, scenes: allScenes };
 }
 
 /** Write a WAV header for 16-bit mono PCM at 24 kHz (Gemini TTS output format). */
@@ -915,17 +1092,19 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
   const out = [];
   for (let c = 0; c < chunks.length; c++) {
     const chunk = chunks[c];
-    // Moment-level cutting: the TTS text is every SENTENCE (one <long pause>
+    // Moment-level cutting: the TTS text is every unit (one <long pause>
     // between each), still ONE Gemini call per chunk — quota cost unchanged.
     // The audio is then split in two levels: scenes first (proven), then
     // sentences inside each scene slice (short file, tight tolerance).
-    // Either level failing drops that scene back to scene-level audio —
-    // a bad moment split never fails the job.
-    const momentMode =
-      MOMENT_CUT && chunk.every((s) => Array.isArray(s.segments) && s.segments.length > 1);
-    const joined = momentMode
-      ? chunk.flatMap((s) => s.segments.map((g) => g.text)).join('\n<long pause>\n')
-      : chunk.map((s) => s.narrationMy).join('\n<long pause>\n');
+    // Moment mode is PER-SCENE, not all-or-nothing for the whole chunk:
+    // a scene with valid segments contributes its sentences, a scene
+    // without contributes its whole narration — one bad scene used to
+    // disable moment-cutting for the entire recap. Either level failing
+    // drops that scene back to scene-level audio — a bad moment split
+    // never fails the job.
+    const joined = chunk
+      .flatMap((s) => chunkTtsUnits(s))
+      .join('\n<long pause>\n');
     const wholeMp3 = path.join(audioDir, `whole_${c}.mp3`);
     const wavPath = path.join(audioDir, `whole_${c}.wav`);
     const buffer = await generateTtsAudioBuffer(
@@ -947,14 +1126,17 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
         const { segments: _dropped, ...rest } = s;
         return rest;
       }));
-    } else if (!momentMode) {
-      chunk.forEach((scene, i) =>
-        out.push({ ...scene, audioPath: segments[i].path, audioDurationSec: segments[i].durationSec })
-      );
     } else {
+      // Per-scene moment mode: each scene with valid segments is split
+      // into its sentences; a scene without segments keeps scene-level
+      // audio. A failed sentence split drops only that scene.
       for (let i = 0; i < chunk.length; i++) {
         const scene = chunk[i];
         const slice = segments[i];
+        if (!hasMomentSegments(scene)) {
+          out.push({ ...scene, audioPath: slice.path, audioDurationSec: slice.durationSec });
+          continue;
+        }
         const segSplit = await splitAudioBySilence(slice.path, scene.segments, audioDir, {
           toleranceSec: Math.max(1.5, 0.08 * slice.durationSec),
           outPrefix: `chunk${c}-s${i + 1}-seg`,
@@ -988,6 +1170,7 @@ module.exports = {
   ANALYSIS_MODEL,
   MOMENT_CUT,
   SCRIPT_MODEL,
+  SCRIPT_CHUNK_BEATS,
   TTS_MODEL,
   TTS_MODELS,
   isDailyQuotaError,
@@ -998,6 +1181,15 @@ module.exports = {
   analyzeVideoWithFiles,
   analyzeVideoAuto,
   generateScript,
+  generateScriptChunk,
+  splitBeatsIntoChunks,
+  splitSentences,
+  normaliseSegments,
+  buildSegmentsFromMoments,
+  normaliseModelSegments,
+  computeDriftRisk,
+  hasMomentSegments,
+  chunkTtsUnits,
   generateSceneAudio,
   generateRecapAudio,
   splitAudioBySilence,

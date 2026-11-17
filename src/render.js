@@ -18,8 +18,12 @@
  * scene 1 (45s window, 57s narration) replayed its footage while the
  * narration moved on, and 150s windows only showed their first ~47s while
  * the narration described the whole stretch. Scenes are now one beat
- * (30-60s) with narration sized to the beat, so the gentle 0.9x-1.1x
+ * (8-15s) with narration sized to the beat, so the gentle 0.9x-1.1x
  * tempo path is the normal case and extend/trim are only safety nets.
+ * 2026-11-17 (beat lock): a no-segment scene's clip is shrunk to start at
+ * its first narrated moment (from the analysis moments), not at the clip
+ * start — the old start-trim showed the clip's start while narrating its
+ * end (job b27e7aa3 scene 1).
  */
 const fs = require('fs');
 const path = require('path');
@@ -217,17 +221,77 @@ async function renderRecapFast({ sourceVideo, scenes, workDir, out720, out480 })
 }
 
 /**
+ * BEAT LOCK (2026-11-17, YouTube recap study): find the first analysis
+ * moment a no-segment scene's narration is about. The narration is in
+ * time order (the script prompt requires it), so the first moment inside
+ * the scene's window is the first narrated moment; fall back to the
+ * beat's first moment when the window contains none. Returns null when
+ * no moments are available (no sceneSummaries passed, or the beat has
+ * none) — the caller then keeps the scene's window unchanged.
+ */
+function firstMomentForScene(scene, sceneSummaries) {
+  if (!Array.isArray(sceneSummaries) || sceneSummaries.length === 0) return null;
+  const wStart = Number(scene.sourceStartSec) || 0;
+  const wEnd = Number(scene.sourceEndSec) || 0;
+  let best = null;
+  let bestOverlap = -1;
+  for (const b of sceneSummaries) {
+    const overlap = Math.max(0, Math.min(wEnd, b.endSec) - Math.max(wStart, b.startSec));
+    if (overlap > bestOverlap) {
+      bestOverlap = overlap;
+      best = b;
+    }
+  }
+  if (!best || !Array.isArray(best.moments)) return null;
+  const moments = best.moments
+    .map((m) => ({ atSec: Number(m.atSec) || 0, what: String(m.what || '').trim() }))
+    .filter((m) => m.what)
+    .sort((a, b) => a.atSec - b.atSec);
+  if (moments.length === 0) return null;
+  return moments.find((m) => m.atSec >= wStart && m.atSec < wEnd) || moments[0];
+}
+
+/**
+ * Shrink a no-segment scene's clip to start at its first narrated moment
+ * instead of at the clip start. The old behaviour started the clip at
+ * sourceStartSec and trimmed it to the narration length — showing the
+ * clip's start while narrating its end (job b27e7aa3 scene 1: bridge at
+ * 30-43s while narrating the brain at 62s). Scenes with segments are
+ * untouched (their windows already carry the moments); scenes with no
+ * usable moment are untouched. The end is kept at least as far as the
+ * audio needs, so the fast path stays eligible when the ratio is right —
+ * renderSceneSegment trims a long window to the audio length anyway.
+ */
+function shrinkSceneToFirstMoment(scene, sceneSummaries) {
+  if (Array.isArray(scene.segments) && scene.segments.length > 1) return scene;
+  const moment = firstMomentForScene(scene, sceneSummaries);
+  if (!moment) return scene;
+  const origStart = Number(scene.sourceStartSec) || 0;
+  const origEnd = Number(scene.sourceEndSec) || 0;
+  const start = moment.atSec;
+  if (start <= origStart || start >= origEnd) return scene;
+  const audioDur = scene.audioDurationSec || 0;
+  const end = audioDur > 0 ? Math.max(origEnd, start + audioDur) : origEnd;
+  return { ...scene, sourceStartSec: start, sourceEndSec: end, startSec: start, endSec: end };
+}
+
+/**
  * Render the full recap.
  * scenes: [{ sourceStartSec, sourceEndSec, audioPath, audioDurationSec }]
+ * sceneSummaries (optional): the analysis beats with timestamped moments —
+ * used to shrink no-segment scenes to their first narrated moment.
  * Returns { out720, out480, durationSec }.
  */
-async function renderRecap({ sourceVideo, scenes, workDir, out720, out480 }) {
+async function renderRecap({ sourceVideo, scenes, workDir, out720, out480, sceneSummaries }) {
   if (!scenes || scenes.length === 0) throw new Error('renderRecap: no scenes with audio.');
+  // Shrink no-segment scenes to their first moment BEFORE the fast path,
+  // so both paths cut from the moment, not the clip start.
+  const effScenes = scenes.map((s) => shrinkSceneToFirstMoment(s, sceneSummaries));
   // Fast path first (RENDER_FAST=0 disables it): stream-copy cuts + mux,
   // no video re-encode — the slow re-encode below is the fallback.
   if (process.env.RENDER_FAST !== '0') {
     try {
-      const fast = await renderRecapFast({ sourceVideo, scenes, workDir, out720, out480 });
+      const fast = await renderRecapFast({ sourceVideo, scenes: effScenes, workDir, out720, out480 });
       if (fast) {
         console.log('[render] fast path used: no video re-encode');
         return fast;
@@ -241,8 +305,8 @@ async function renderRecap({ sourceVideo, scenes, workDir, out720, out480 }) {
   fs.mkdirSync(segDir, { recursive: true });
 
   const segmentPaths = [];
-  for (let i = 0; i < scenes.length; i++) {
-    const s = scenes[i];
+  for (let i = 0; i < effScenes.length; i++) {
+    const s = effScenes[i];
     // Moment-level cutting: one sub-segment per sentence, each cut from
     // the exact moment its sentence describes (sourceStartSec is that
     // moment's timestamp, not the scene start). The sub-segments concat in
@@ -311,4 +375,4 @@ async function renderRecap({ sourceVideo, scenes, workDir, out720, out480 }) {
   return { out720, out480: out480 || null, durationSec };
 }
 
-module.exports = { ffprobeDuration, ffprobeStreams, cutClip, renderSceneSegment, renderRecap, renderRecapFast, clampSpeed };
+module.exports = { ffprobeDuration, ffprobeStreams, cutClip, renderSceneSegment, renderRecap, renderRecapFast, clampSpeed, firstMomentForScene, shrinkSceneToFirstMoment };

@@ -34,7 +34,7 @@ async function runAnalysis(jobId) {
   try {
     setStage(jobId, 'analysing', 10);
     const framesDir = path.join(dir, 'frames');
-    const summaries = await gemini.analyzeVideo(job.sourcePath, framesDir);
+    const summaries = await gemini.analyzeVideoAuto(job.sourcePath, framesDir);
     store.updateJob(jobId, { sceneSummaries: summaries });
     setStage(jobId, 'scripting', 30);
 
@@ -45,6 +45,9 @@ async function runAnalysis(jobId) {
       fileName: job.originalName,
     });
     // Give each scene a real source window; Gemini already returns sourceStart/End.
+    // Carry the code-built per-sentence segments and the driftRisk flag
+    // through — dropping them here used to silently disable moment-cutting
+    // for the whole job (the script had segments, the record did not).
     const scenes = script.scenes.map((s, i) => ({
       sceneNumber: s.sceneNumber || i + 1,
       sourceStartSec: s.sourceStartSec ?? 0,
@@ -52,6 +55,8 @@ async function runAnalysis(jobId) {
       startSec: s.sourceStartSec ?? 0,
       endSec: s.sourceEndSec ?? 0,
       narrationMy: s.narrationMy || '',
+      ...(Array.isArray(s.segments) && s.segments.length > 1 ? { segments: s.segments } : {}),
+      driftRisk: s.driftRisk === true,
       audioPath: null,
       audioDurationSec: null,
     }));
@@ -148,6 +153,7 @@ async function runGenerate(jobId) {
     const { durationSec } = await render.renderRecap({
       sourceVideo: job.sourcePath,
       scenes: scenesWithAudio,
+      sceneSummaries: job.sceneSummaries || null,
       workDir: dir,
       out720,
       out480,

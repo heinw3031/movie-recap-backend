@@ -25,7 +25,7 @@ const gemini = require('./src/gemini');
 
 const PORT = Number(process.env.PORT || 8080);
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 500);
-const VALID_LENGTHS = [5, 10, 15, 30];
+const VALID_LENGTHS = [5, 10, 15, 30, 60];
 
 const app = express();
 // CORS: the JSON API (approve script, generate) is called cross-origin from
@@ -113,16 +113,44 @@ app.post('/api/jobs/:id/script', (req, res) => {
   }
   const updated = store.updateJob(job.jobId, {
     title: typeof req.body.title === 'string' ? req.body.title : job.title,
-    scenes: scenes.map((s, i) => ({
-      sceneNumber: Number(s.sceneNumber) || i + 1,
-      sourceStartSec: Number(s.sourceStartSec),
-      sourceEndSec: Number(s.sourceEndSec),
-      startSec: Number(s.sourceStartSec),
-      endSec: Number(s.sourceEndSec),
-      narrationMy: String(s.narrationMy),
-      audioPath: null,
-      audioDurationSec: null,
-    })),
+    // Keep the code-built per-sentence segments through approval — dropping
+    // them here used to silently disable moment-cutting for the whole job.
+    // Segments survive ONLY when they still match the approved narration:
+    // if the user edited the text, the segment texts no longer join to it
+    // and the stale segments are dropped (the scene then renders
+    // scene-level, shrunk to its first moment). driftRisk is recomputed
+    // from the approved narration and range.
+    scenes: scenes.map((s, i) => {
+      const narrationMy = String(s.narrationMy);
+      const startSec = Number(s.sourceStartSec);
+      const endSec = Number(s.sourceEndSec);
+      let segments = null;
+      if (Array.isArray(s.segments) && s.segments.length > 1) {
+        const norm = s.segments
+          .map((g) => ({
+            text: String((g && g.text) || '').trim(),
+            sourceStartSec: Number((g && g.sourceStartSec) || 0),
+            sourceEndSec: Number((g && g.sourceEndSec) || 0),
+          }))
+          .filter((g) => g.text && g.sourceEndSec > g.sourceStartSec);
+        const joined = norm.map((g) => g.text).join(' ');
+        if (norm.length > 1 && joined.replace(/\s+/g, ' ') === narrationMy.replace(/\s+/g, ' ')) {
+          segments = norm;
+        }
+      }
+      return {
+        sceneNumber: Number(s.sceneNumber) || i + 1,
+        sourceStartSec: startSec,
+        sourceEndSec: endSec,
+        startSec,
+        endSec,
+        narrationMy,
+        ...(segments ? { segments } : {}),
+        driftRisk: gemini.computeDriftRisk(narrationMy, startSec, endSec, Boolean(segments)),
+        audioPath: null,
+        audioDurationSec: null,
+      };
+    }),
   });
   return res.json({ jobId: job.jobId, status: updated.status, scenes: updated.scenes.length, message: 'Script approved. Call POST /api/jobs/:id/generate to start TTS + render.' });
 });

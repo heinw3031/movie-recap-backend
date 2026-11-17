@@ -53,15 +53,19 @@ function isRetryableError(err) {
   );
 }
 
-async function withRetry(fn, what) {
+async function withRetry(fn, what, opts = {}) {
   const delays = [15000, 30000, 60000, 60000, 90000];
+  // opts.maxRetries caps the retries (default: all 5). Verification passes
+  // 0 — a 503 there must fail fast (see verifyMomentGroupWithModel).
+  const maxRetries =
+    typeof opts.maxRetries === 'number' ? Math.max(0, opts.maxRetries) : delays.length;
   let lastErr;
-  for (let attempt = 0; attempt <= delays.length; attempt++) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (!isRetryableError(err) || attempt === delays.length) throw err;
+      if (!isRetryableError(err) || attempt === maxRetries) throw err;
       const hinted = retryDelayFromError(err);
       const wait = Math.min(Math.max(hinted || delays[attempt], delays[attempt]), 120000);
       console.log(`[gemini] ${what} failed (attempt ${attempt + 1}): ${String(err.message).slice(0, 120)} — retrying in ${Math.round(wait / 1000)}s`);
@@ -473,6 +477,11 @@ async function verifyMomentGroupWithModel(ai, group) {
       '- Return one verdict per moment id, in the same order as the moments above. Do not add moments, do not drop any.',
     ].join('\n'),
   });
+  // NO RETRY on verification (2026-11-17 lesson, job 445745b2): every 503
+  // attempt counts against the 3.8-flash 20/day quota, and 5 retries per
+  // group exhausted it with zero verified moments. A failed group keeps
+  // its moments unverified and the pipeline continues — never burn quota
+  // retrying an overloaded model here.
   const response = await withRetry(
     () =>
       ai.models.generateContent({
@@ -480,7 +489,8 @@ async function verifyMomentGroupWithModel(ai, group) {
         contents: [{ parts }],
         config: { responseMimeType: 'application/json' },
       }),
-    'moment verification'
+    'moment verification',
+    { maxRetries: 0 }
   );
   const text = response.text;
   if (!text) return [];
@@ -714,16 +724,19 @@ async function verifyMoments(beats, videoPath, workDir, opts = {}) {
 /**
  * The style model: a REAL narration from Recappian Myanmar 2.0 (Real Steel
  * recap, first ~3 min, auto-captions cleaned). The user caught that my
- * hand-written rules produced WRITTEN prose — long dense sentences stuffed
- * with adjectives ("dim flickering light, dark cold lab") — while the real
- * narrator uses SHORT sentences, one or two facts each, plain everyday
- * words, and never describes appearances. This example IS the style: Gemini
+ * hand-written rules produced WRITTEN prose — stuffed with adjectives and
+ * appearance descriptions ("dim flickering light, dark cold lab"). The real
+ * narrator tells a STORY in LONG DENSE sentences — 4-7 events chained with
+ * ပြီး/တော့/ကြောင့်/အဲ့ဒါကြောင့်/အဲ့လိုနဲ့/နောက်ဆုံး — plain everyday words,
+ * never describing appearances. This example IS the style: Gemini
  * copies its voice instead of following my rules. (2026-11-16: user said
  * "Gemini ကို script ရေးခိုင်း" — let Gemini write the script.)
  * (2026-11-17, user correction: the auto-captions normalised the endings to
  * formal ပါတယ်, but the SPOKEN narration is casual တယ် — ပါတယ် sounds like a
  * formal newsreader and does NOT fit spoken narration. The example below is
- * converted to the casual spoken register; every sentence ends in တယ်.)
+ * converted to the casual spoken register. (2026-11-17 ~14:55: the user
+ * rejected forcing EVERY sentence to end in တယ် — endings must vary
+ * naturally like speech, never one particle stamped on every sentence.)
  */
 const REAL_STYLE_EXAMPLE = [
   'ချာလီက အကြွေးပတ်လည်ဝိုင်းနေတဲ့ စက်ရုပ်ဖိုက်တာ လောင်းကစားသမားတစ်ယောက်ဖြစ်တယ်။',
@@ -735,18 +748,11 @@ const REAL_STYLE_EXAMPLE = [
   'ဒါပေမဲ့ အမေက သေတန်းစာမချန်ခဲ့တဲ့အတွက် တရားဥပဒေအရ အဖေဖြစ်တဲ့ ချာလီပဲ စောင့်ရှောက်ခွင့်ရမှာဖြစ်တယ်။',
   'အဲ့ဒါကိုသိတဲ့ ချာလီက ဒေါ်လာ၁သိန်းပေးရင် အုပ်ထိန်းခွင့်ပေးမယ်လို့ ပြောတယ်။',
   'မိန်းမ အလိုက်ချင်နေတဲ့ မှာလဲ သဘောတူလိုက်ပြီး လောလောဆယ်တော့ ခရီးသွားဖို့ရှိတာကြောင့် ဧည့်ရပ်တွေမှာ ကလေးကို ခဏကြည့်ပေးထားဖို့ ပြောတယ်။',
-  'ချာလီကလဲ လက်ခံလိုက်တယ်။ အိမ်မရှိတဲ့ ချာလီက သွေးရည်းစားဘဲမှာ နေတယ်။',
-  'မာဘင်က ပိုက်ဆံပေးတာကို မက်သိသွားတော့ ကိုယ့်သားကိုယ်တောင် ရောင်းစားတဲ့အဖေဆိုပြီး မုန်နေတယ်။',
-  'ဂရုမစိုက်ဘဲ သူလိုချင်တဲ့ စက်ရုပ်ကို ဝယ်လိုက်တယ်။ စက်ရုပ်နာမည်က နွိုင်စီဝိုင်းဖြစ်ပြီး လွန်ခဲ့တဲ့ ငါးနှစ်က ချန်ပီယံ စက်ရုပ်ဖြစ်တယ်။',
-  'မက်ကလဲ စက်ရုပ်လက်ဝှေ့ပွဲတွေကို ကြိုက်တာကြောင့် နွိုင်စီဝိုင်းရဲ့ နိုင်ပွဲတွေအားလုံးကို သိနေတယ်။',
-  'ချာလီနဲ့ မက်တို့က စက်ရုပ်လက်ဝှေ့ပွဲကို သွားဖို့ ပြင်ဆင်တယ်။ မက်ကလဲ မခေါ်တဲ့ကြားက အတင်းလိုက်သွားတယ်။',
-  'ပွဲကို ရောက်တော့ ချာလီက ပွဲသေးသေးတွေ မထိုးပဲ နာမည်ကြီး စက်ရုပ်တွေနဲ့ပဲ ထိုးချင်နေတယ်။',
-  'မက်က ပွဲသေးသေးတွေကနေ တဆင့်ခြင်း တက်သွားဖို့ ပြောပေမယ့် လုပ်ချင်ရာစုလုပ်တဲ့ ချာလီကတော့ အကြမ်းဆုံးကောင်နဲ့ ပွဲတည်လိုက်တယ်။',
-  'အဲ့လိုနဲ့ ပွဲစတော့ နွိုင်စီဝိုင်းက အသာစီးရသလိုရှိပေမယ့် ချာလီက အသံစနစ်တွေကို ကြိုကြည့်မလာတာကြောင့် အခွင့်အရေးအရ လဲ မထိုးမိဘဲ တုံ့ဆိုင်းတုံ့ဆိုင်းဖြစ်နေတယ်။',
-  'အဲ့ဒါကြောင့်ပဲ တစ်ဖက်စက်ရုပ်က နွိုင်စီဝိုင်းကို ပယ်ပယ်နယ်နဲ့ ပြန်ဆော်တယ်။',
-  'တရားမဝင် လက်ဝှေ့ပွဲဖြစ်လို့ စည်းမျဉ်းတွေလဲ မရှိတာကြောင့် လက်တစ်ဖက်ပါ ပြတ်သွားတယ်။',
-  'ချာလီကတော့ အခုချိန်ထိတောင် ဘာလုပ်ခံရမှန်းမသိဘဲ တိုင်ပတ်နေတယ်။',
-  'နောက်ဆုံးမှာ တော့ နွိုင်စီဝိုင်း ခေါင်းပျက်ပြီး ချာလီတို့ ရှုံးသွားတယ်။',
+  'ချာလီကလဲ လက်ခံလိုက်တယ်၊ အိမ်မရှိတဲ့ ချာလီက သွေးရည်းစားဘဲမှာ နေတယ်၊ မာဘင်က ပိုက်ဆံပေးတာကို မက်သိသွားတော့ ကိုယ့်သားကိုယ်တောင် ရောင်းစားတဲ့အဖေဆိုပြီး မုန်နေတယ်၊ ဂရုမစိုက်ဘဲ သူလိုချင်တဲ့ စက်ရုပ်ကို ဝယ်လိုက်တယ်၊ စက်ရုပ်နာမည်က နွိုင်စီဝိုင်းဖြစ်ပြီး လွန်ခဲ့တဲ့ ငါးနှစ်က ချန်ပီယံ စက်ရုပ်ဖြစ်တယ်။',
+  'မက်ကလဲ စက်ရုပ်လက်ဝှေ့ပွဲတွေကို ကြိုက်တာကြောင့် နွိုင်စီဝိုင်းရဲ့ နိုင်ပွဲတွေအားလုံးကို သိနေတယ်၊ ချာလီနဲ့ မက်တို့က စက်ရုပ်လက်ဝှေ့ပွဲကို သွားဖို့ ပြင်ဆင်တယ်၊ မက်ကလဲ မခေါ်တဲ့ကြားက အတင်းလိုက်သွားတယ်။',
+  'ပွဲကို ရောက်တော့ ချာလီက ပွဲသေးသေးတွေ မထိုးပဲ နာမည်ကြီး စက်ရုပ်တွေနဲ့ပဲ ထိုးချင်နေတယ်၊ မက်က ပွဲသေးသေးတွေကနေ တဆင့်ခြင်း တက်သွားဖို့ ပြောပေမယ့် လုပ်ချင်ရာစုလုပ်တဲ့ ချာလီကတော့ အကြမ်းဆုံးကောင်နဲ့ ပွဲတည်လိုက်တယ်။',
+  'အဲ့လိုနဲ့ ပွဲစတော့ နွိုင်စီဝိုင်းက အသာစီးရသလိုရှိပေမယ့် ချာလီက အသံစနစ်တွေကို ကြိုကြည့်မလာတာကြောင့် အခွင့်အရေးအရ လဲ မထိုးမိဘဲ တုံ့ဆိုင်းတုံ့ဆိုင်းဖြစ်နေတယ်၊ အဲ့ဒါကြောင့်ပဲ တစ်ဖက်စက်ရုပ်က နွိုင်စီဝိုင်းကို ပယ်ပယ်နယ်နဲ့ ပြန်ဆော်တယ်။',
+  'တရားမဝင် လက်ဝှေ့ပွဲဖြစ်လို့ စည်းမျဉ်းတွေလဲ မရှိတာကြောင့် လက်တစ်ဖက်ပါ ပြတ်သွားတယ်၊ ချာလီကတော့ အခုချိန်ထိတောင် ဘာလုပ်ခံရမှန်းမသိဘဲ တိုင်ပတ်နေတယ်၊ နောက်ဆုံးမှာ တော့ နွိုင်စီဝိုင်း ခေါင်းပျက်ပြီး ချာလီတို့ ရှုံးသွားတယ်။',
   'အမှိုက်သက်သာဖြစ်သွားတဲ့ စက်ရုပ်မှာ အသုံးဝင်သေးတာဆိုလို့ အသံနဲ့ထိန်းချုပ်လို့ရတဲ့ စနစ်တစ်ခုပဲ ကျန်တယ်။',
   'နောက်ထပ် စက်ရုပ်မဝယ်နိုင်တော့တဲ့ ချာလီက သူ့စက်ရုပ်ကို ပြင်ဖို့ စက်ရုပ်သင်္ချိုင်းမှာ အသုံးဝင်နိုင်မယ့် စက်ရုပ်အစိတ်အပိုင်းတွေ သွားရှာတယ်။',
   'ကိုယ့်ကြောင့် ခိုးဝက်ဟိုးဟို တီးတိလိုက်ရှာရင်း မက်က ကမ်းမပေါ်ကနေ ပြုတ်ကျသွားတယ်။',
@@ -930,7 +936,7 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
     'You are the narrator of Recappian Myanmar 2.0 — the most popular Burmese recap channel (883K subs).',
     'Write the script the way the real narrator below writes it. Study this REAL narration first — its voice IS the style. Do not follow any other style description; copy this example:',
     REAL_STYLE_EXAMPLE,
-    'How it sounds — do exactly this: SHORT sentences, one or two facts per sentence, then the next sentence. Plain everyday spoken words (သုံးစားမရတော့တာ, လစ်ထွက်လာတယ်, တိုင်ပတ်နေတယ်, အမှိုက်သက်သာ, ဂရုမစိုက်ဘဲ, အတင်းလိုက်သွားတယ်). NEVER pile up adjectives, NEVER describe how things look — no "dim flickering light", no "dark cold lab", no "blazing blue energy", no "meticulously examining". Just say WHAT HAPPENS, then what happens next. Chain sentences with ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး / နောက်ထပ် / ကံကောင်းပါပဲ / တစ်ခါလဲ. You are telling the story to a friend — NOT explaining it, NOT teaching it, NOT describing a picture.',
+    'How it sounds — do exactly this: LONG DENSE sentences — several events chained in one sentence with ပြီး/တော့/ကြောင့်/အဲ့ဒါကြောင့်/အဲ့လိုနဲ့/နောက်ဆုံး, then the next sentence, like the real example above. Plain everyday spoken words (သုံးစားမရတော့တာ, လစ်ထွက်လာတယ်, တိုင်ပတ်နေတယ်, အမှိုက်သက်သာ, ဂရုမစိုက်ဘဲ, အတင်းလိုက်သွားတယ်). NEVER pile up adjectives, NEVER describe how things look — no "dim flickering light", no "dark cold lab", no "blazing blue energy", no "meticulously examining". Just say WHAT HAPPENS, then what happens next. Chain events inside each sentence with ဒါပေမဲ့ / အဲ့ဒါကြောင့် / အဲ့လိုနဲ့ / နောက်ဆုံး / နောက်ထပ် / ကံကောင်းပါပဲ / တစ်ခါလဲ. You are telling the story to a friend — NOT explaining it, NOT teaching it, NOT describing a picture.',
     'Write a Burmese-language recap script, divided into exactly ' + sceneCount + ' scenes,',
     `for a ${lengthMinutes}-minute recap video. Genre: ${category}.`,
     'Base the story ONLY on these real beats from the video — do not invent characters, twists or an ending that is not in the beats. Each beat is one short moment (8-15s) with exact timestamps:',
@@ -941,7 +947,7 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
     'Requirements (return JSON only, no markdown):',
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     (MOMENT_CUT
-      ? '- MOMENT CUTTING — each scene ALSO returns "segments": one segment per sentence of its narration, in time order: {"segments":[{"text":"...","sourceStartSec":80,"sourceEndSec":95}]}. Each segment is ONE short sentence (1-2 facts) and its window is the EXACT moment that sentence describes: it MUST start at that moment\'s timestamp from the beats (e.g. the bridge walk starts when they step onto the bridge, not at the beat start), and end where the next sentence\'s moment starts (or at the beat end for the last one). Window length must roughly match the sentence when spoken (~15 Burmese characters = 1 second, minimum 4s). NEVER give two sentences the same window, NEVER let a segment\'s window show a different moment than its sentence describes. If the narration says the boy and the girl walk on the bridge, that segment\'s window MUST show them walking on the bridge. "narrationMy" must be exactly the segments\' texts joined in order.'
+      ? '- MOMENT CUTTING — each scene ALSO returns "segments": one segment per sentence of its narration, in time order: {"segments":[{"text":"...","sourceStartSec":80,"sourceEndSec":95}]}. Each segment is ONE sentence — a long dense sentence chaining the moments it describes, in time order — and its window is the EXACT moments that sentence describes: it MUST start at that moment\'s timestamp from the beats (e.g. the bridge walk starts when they step onto the bridge, not at the beat start), and end where the next sentence\'s moment starts (or at the beat end for the last one). Window length must roughly match the sentence when spoken (~15 Burmese characters = 1 second, minimum 4s). NEVER give two sentences the same window, NEVER let a segment\'s window show a different moment than its sentence describes. If the narration says the boy and the girl walk on the bridge, that segment\'s window MUST show them walking on the bridge. "narrationMy" must be exactly the segments\' texts joined in order.'
       : ''),
     '- "scenes": exactly ' + sceneCount + ' items, in story order.',
     '- ONE SCENE PER BEAT: use EVERY beat below — one scene per beat, in story order. NEVER skip a beat, NEVER drop a beat because it looks dull, NEVER merge two beats into one scene, never split a beat, never widen a window. Every beat is a scene; the scene count is ' + sceneCount + ' because there are ' + sceneCount + ' beats.',
@@ -949,8 +955,8 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
     '- ONE SENTENCE = ONE BEAT. Never narrate a story point whose footage is not inside this scene\'s window — SKIP it instead of describing it over other footage. If the narrated action has no footage (a decision, a phone call), narrate it over the footage of the event it causes, and only if that footage is inside the window.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
-    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the CASUAL SPOKEN register, like a friend telling the story — every sentence ends in တယ် (e.g. ဖြစ်တယ်, ပြောတယ်, လုပ်လိုက်တယ်). NEVER write ပါတယ် or ပါတော့တယ် — ပါတယ် is the formal newsreader register and does NOT fit spoken narration; it makes the voice sound stiff and written, not like a person talking. Every scene\'s narration must END with တယ်.',
-    '  2. SHORT sentences — one or two facts per sentence, like the real example above. NEVER write one long dense sentence packed with 4-7 events and adjectives. If a scene needs 10 seconds of narration, write MORE short sentences — do NOT make the sentences longer.',
+    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the CASUAL SPOKEN register, like a friend telling the story. Endings vary the way speech varies — most statements end in တယ် (ဖြစ်တယ်, ပြောတယ်, လုပ်လိုက်တယ်), but let sentences flow into each other with ပြီး/တော့/ကြောင့် and use different closing verbs; NEVER stamp the same ending on every sentence (ending every sentence in တယ် sounds robotic). NEVER write ပါတယ် or ပါတော့တယ် — ပါတယ် is the formal newsreader register and does NOT fit spoken narration; it makes the voice sound stiff and written, not like a person talking.',
+    '  2. LONG DENSE sentences — 4-7 events per sentence, chained with ပြီး/တော့/ကြောင့်/အဲ့ဒါကြောင့်/အဲ့လိုနဲ့/နောက်ဆုံး, like the real example above. A recap is a STORY: character + situation, cause and effect, what happens next — NEVER short one-event clauses, NEVER a list of pictures. If a scene needs 10 seconds of narration, chain MORE moments into the sentence — do NOT split it into short sentences.',
     '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro, no hook question. Start with the premise and run.',
     '  4. NEVER address the viewer directly — no နော် / ပါဦး / လေး to the viewer, no questions to the viewer, no "keep watching" lines. Just tell the story.',
     '  5. Say WHAT HAPPENS, never describe how it looks. Name the action and the reaction, in plain words — one vivid verb per beat. Never write a descriptive passage about light, colour, atmosphere or a place. Never explain why something matters; just say what happened next.',
@@ -958,7 +964,7 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
     '  7. Transliterate ALL foreign character/movie names into Burmese script (Charlie → ချာလီ, Max → မက်, Noisy Boy → နွိုင်စီဝိုင်း). NEVER leave English names in the narration.',
     '  8. Paraphrase dialogue as reported speech with …ဆိုပြီး / …လို့ (e.g. "ကိုယ့်သားကိုယ်တောင်ရောင်းစားတဲ့အဖေဆိုပြီး မုန်နေတယ်"). Quote at most one short punchline in the whole recap.',
     '  9. Each scene\'s narration must describe ONLY what is actually visible and happening inside its own clip range (sourceStartSec–sourceEndSec) — and IN TIME ORDER: walk through the range\'s moments from first to last, one clause per moment, exactly as they appear on screen. Never jump ahead to a later moment, never invent, never repeat another scene\'s event. If the range shows a bridge argument, say ONLY the bridge argument; if it shows a lab, say ONLY the lab.',
-    '  10. LENGTH: each scene\'s narration must last about as long as its clip range — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. Roughly 15 Burmese characters = 1 spoken second. Fill the range with MORE short sentences, in time order, adding more moments, reactions and comments until the scene is full. NEVER make sentences longer to fill time. A narration much shorter than its range means the moments at the END of the range are never seen or heard — too short is a failure.',
+    '  10. LENGTH: each scene\'s narration must last about as long as its clip range — target about ' + targetSecPerScene + ' seconds per scene, so the whole recap lasts about ' + lengthMinutes + ' minutes. Roughly 15 Burmese characters = 1 spoken second. Fill the range by chaining MORE moments into the sentences with ပြီး/တော့/ကြောင့်, in time order, adding more moments, reactions and consequences until the scene is full — longer dense sentences, not more short ones. A narration much shorter than its range means the moments at the END of the range are never seen or heard — too short is a failure.',
     '  11. End the LAST scene with the story\'s closing beat. No subscribe call, no closing line to the viewer — the story ends when the story ends.',
     '- The file was uploaded as "' + (fileName || 'video.mp4') + '" — use it only as a label, never as the source of the plot.',
   ].join('\n');
@@ -1052,7 +1058,7 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
   });
   if (short.length > 0) {
     const expandPrompt = [
-      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 15 Burmese characters per second). Keep the same clip range and the same style: SHORT sentences, one or two facts per sentence, plain everyday spoken words — never pile up adjectives, never describe how things look, just say what happens next; no ဗျာ/ဗျ ever, no literary သည်/များ/၏/၌, တယ် endings (casual spoken — never ပါတယ်), transliterated names, in time order over the range\'s moments, and describe ONLY what happens inside the range. Add MORE short sentences to fill the time — never make the sentences longer.',
+      'You are the same Myanmar recap narrator. Expand ONLY these scenes so each narration lasts about its clip range when spoken (about 15 Burmese characters per second). Keep the same clip range and the same style: LONG DENSE sentences, several events chained with ပြီး/တော့/ကြောင့်, plain everyday spoken words — never pile up adjectives, never describe how things look, just say what happens next; no ဗျာ/ဗျ ever, no literary သည်/များ/၏/၌, natural spoken endings that vary (never force every sentence to end in တယ်, never ပါတယ်), transliterated names, in time order over the range\'s moments, and describe ONLY what happens inside the range. Chain MORE moments into the sentences to fill the time — never split them into short sentences.',
       'Return JSON only, no markdown: {"scenes":[{"sceneNumber":1,"narrationMy":"..."}]}',
       ...short.map(
         (s) =>

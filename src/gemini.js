@@ -477,11 +477,16 @@ async function verifyMomentGroupWithModel(ai, group) {
       '- Return one verdict per moment id, in the same order as the moments above. Do not add moments, do not drop any.',
     ].join('\n'),
   });
-  // NO RETRY on verification (2026-11-17 lesson, job 445745b2): every 503
-  // attempt counts against the 3.8-flash 20/day quota, and 5 retries per
-  // group exhausted it with zero verified moments. A failed group keeps
-  // its moments unverified and the pipeline continues — never burn quota
-  // retrying an overloaded model here.
+  // LIMITED RETRY on verification (2026-11-17, job ba0f4eee): maxRetries 0
+  // made verification fail PERMANENTLY on transient 503s — all 3 groups
+  // threw (2x 503 + 1x fetch failed) and 0 moments were verified, so the
+  // wrong descriptions were never caught. Analysis and scripting retry
+  // and recovered from the SAME 503 window (each needed 4 attempts), so
+  // verification gets 3 retries (4 attempts) to ride out a transient
+  // overload. This is NOT the old 5-retry burn (job 445745b2): that
+  // overload lasted ~11h and nothing succeeded, so retries were futile;
+  // here the overload is transient and retries recover. A failed group
+  // still keeps its moments unverified and the pipeline continues.
   const response = await withRetry(
     () =>
       ai.models.generateContent({
@@ -490,7 +495,7 @@ async function verifyMomentGroupWithModel(ai, group) {
         config: { responseMimeType: 'application/json' },
       }),
     'moment verification',
-    { maxRetries: 0 }
+    { maxRetries: 3 }
   );
   const text = response.text;
   if (!text) return [];

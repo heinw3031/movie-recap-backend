@@ -50,7 +50,7 @@ async function runAnalysis(jobId) {
     } catch (err) {
       console.log(`[job ${jobId}] moment verification failed (${String(err.message).slice(0, 120)}) — continuing with unverified moments`);
     }
-    console.log(`[job ${jobId}] moments: ${verified.stats.verified} verified, ${verified.stats.corrected} corrected, ${verified.stats.dropped} dropped, ${verified.stats.unverified} unverified (${verified.stats.calls} verification call(s), ${verified.stats.status})`);
+    console.log(`[job ${jobId}] moments: ${verified.stats.verified} verified, ${verified.stats.corrected} corrected, ${verified.stats.dropped} dropped, ${verified.stats.unverified} unverified, ${verified.stats.descriptionsRewritten || 0} beat description(s) rewritten from verified frames, ${verified.stats.beatsUngrounded || 0} beat(s) with no verified evidence (${verified.stats.calls} verification call(s), ${verified.stats.status})`);
     store.updateJob(jobId, {
       sceneSummaries: verified.beats,
       momentsTotal: verified.stats.total,

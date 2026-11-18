@@ -575,9 +575,18 @@ async function verifyMomentGroupWithModel(ai, group) {
  *  - rejected without a usable correction: the moment is DROPPED.
  *  - no verdict for a moment: the moment is KEPT (unverified — a bad or
  *    incomplete verification must never gut the script).
- * A correction outside its own beat is treated as no correction (dropped):
- * moving a moment across beats would shuffle the story, and the event is
- * usually already covered by the neighbouring beat's moments.
+ * DESCRIPTION GROUNDING (2026-11-18, job da2908ab): verification used to
+ * rebuild ONLY the moments — the beat's description was untouched — and
+ * the script is written from the description, so a wrong description
+ * still produced wrong narration even after its moments were dropped
+ * (91/100 dropped, narration still mismatched at 4 of 5 checked
+ * moments). So a beat where verification found an error gets its
+ * description REBUILT from verified evidence only: its kept moments'
+ * claims, plus what each dropped moment's frame ACTUALLY shows (the
+ * verdicts' `actual` text, free with the verdicts — zero extra Gemini
+ * calls). A beat with no verified evidence keeps its original
+ * description but is flagged driftRisk. A beat verification did not
+ * touch keeps its description exactly as analysed.
  * `events` lists the dropped/corrected moments (for the console log).
  */
 function applyVerdicts(beats, moments, verdicts) {
@@ -586,22 +595,37 @@ function applyVerdicts(beats, moments, verdicts) {
     const id = Number(v && v.id);
     if (Number.isFinite(id) && !byId.has(id)) byId.set(id, v);
   }
-  const stats = { total: moments.length, verified: 0, corrected: 0, dropped: 0, unverified: 0 };
+  const stats = { total: moments.length, verified: 0, corrected: 0, dropped: 0, unverified: 0, descriptionsRewritten: 0, beatsUngrounded: 0 };
   const events = [];
   const correctedAt = new Map(); // moment id -> new atSec
   const droppedIds = new Set();
+  const touchedBeats = new Set(); // beatIndex where verification found an error
+  const keptWhatsByBeat = new Map(); // beatIndex -> [kept moment claims, time order]
+  const actualByBeat = new Map(); // beatIndex -> [what dropped moments' frames actually show]
+  const pushTo = (map, bi, text) => {
+    const t = String(text || '').trim();
+    if (!t) return;
+    if (!map.has(bi)) map.set(bi, []);
+    map.get(bi).push(t);
+  };
   for (const m of moments) {
     const v = byId.get(m.id);
     if (!v) {
       stats.unverified++;
+      pushTo(keptWhatsByBeat, m.beatIndex, m.what);
       continue;
     }
     if (v.confirmed === true) {
       stats.verified++;
+      pushTo(keptWhatsByBeat, m.beatIndex, m.what);
       continue;
     }
     const beat = beats[m.beatIndex];
-    const corr = Number(v.correctedAtSec);
+    // correctedAtSec null means "no correction" — Number(null) is 0, so
+    // a null must NOT be read as a correction to 0s (a beat starting at
+    // 0-5s would otherwise "correct" a rejected moment to 0s instead of
+    // dropping it). Found by the description-grounding test, 2026-11-18.
+    const corr = v.correctedAtSec == null ? NaN : Number(v.correctedAtSec);
     const inBeat =
       beat &&
       Number.isFinite(corr) &&
@@ -613,17 +637,22 @@ function applyVerdicts(beats, moments, verdicts) {
       const clamped = Math.max(beat.startSec, Math.min(beat.endSec, corr));
       correctedAt.set(m.id, clamped);
       stats.corrected++;
+      touchedBeats.add(m.beatIndex);
+      pushTo(keptWhatsByBeat, m.beatIndex, m.what);
       events.push({ id: m.id, atSec: m.atSec, what: m.what, outcome: 'corrected', actual: String(v.actual || ''), correctedAtSec: clamped });
     } else {
       droppedIds.add(m.id);
       stats.dropped++;
+      touchedBeats.add(m.beatIndex);
+      pushTo(actualByBeat, m.beatIndex, v.actual);
       events.push({ id: m.id, atSec: m.atSec, what: m.what, outcome: 'dropped', actual: String(v.actual || ''), correctedAtSec: null });
     }
   }
   // Rebuild each beat's moments from the flat list, so a dropped moment
-  // disappears and a corrected moment moves — the beat's other fields
-  // (description, range) are untouched. Kept moments are re-sorted into
-  // time order: a corrected moment can otherwise sit after a later one.
+  // disappears and a corrected moment moves — the beat's description is
+  // REBUILT too, but ONLY for beats verification touched (see header):
+  // kept moments' claims + what dropped moments' frames actually show.
+  // Untouched beats keep their analysed description exactly.
   const byBeatMoment = new Map();
   for (const m of moments) byBeatMoment.set(`${m.beatIndex}:${m.momentIndex}`, m);
   const newBeats = beats.map((b, bi) => {
@@ -642,7 +671,21 @@ function applyVerdicts(beats, moments, verdicts) {
       }
     });
     kept.sort((a, b) => a.atSec - b.atSec);
-    return { ...b, moments: kept };
+    let description = b.description;
+    let driftRisk = b.driftRisk === true;
+    if (touchedBeats.has(bi)) {
+      const parts = [...(keptWhatsByBeat.get(bi) || [])];
+      const actuals = actualByBeat.get(bi) || [];
+      if (actuals.length > 0) parts.push(`frame actually shows: ${actuals.join('; ')}`);
+      if (parts.length > 0) {
+        description = parts.join('; ');
+        stats.descriptionsRewritten++;
+      } else {
+        driftRisk = true;
+        stats.beatsUngrounded++;
+      }
+    }
+    return { ...b, moments: kept, description, ...(driftRisk ? { driftRisk } : {}) };
   });
   return { beats: newBeats, stats, events };
 }
@@ -979,7 +1022,7 @@ function splitBeatsIntoChunks(sceneSummaries, chunkSize = SCRIPT_CHUNK_BEATS) {
  * targetSecPerScene is computed from the TOTAL beat count by the wrapper,
  * so the concatenated recap still lasts about lengthMinutes.
  */
-async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fileName, targetSecPerScene, chunkIndex, totalChunks }) {
+async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fileName, targetSecPerScene, chunkIndex, totalChunks, priorNarration }) {
   const ai = getClient();
   // ONE SCENE PER BEAT — every analysed beat becomes a scene. The model
   // kept "picking" beats and dropping turning points (the orange laser grid
@@ -1005,6 +1048,9 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
     ...(totalChunks > 1
       ? ['This is part ' + (chunkIndex + 1) + ' of ' + totalChunks + ' of one ' + lengthMinutes + '-minute recap — the beats below are one consecutive stretch of the full story. Write ONLY these beats, in story order; do not add an opening or a closing for the whole recap (the first part opens it, the last part closes it).']
       : []),
+    ...(chunkIndex > 0 && priorNarration
+      ? ['Characters were already introduced in the earlier part — reuse their Burmese name spellings EXACTLY as written in this excerpt, do not re-transliterate them (job da2908ab switched တွန်း to သုမ် at the chunk boundary, scene 43): ' + priorNarration]
+      : []),
     'Requirements (return JSON only, no markdown):',
     '{"title":"catchy Burmese title","scenes":[{"sceneNumber":1,"sourceStartSec":0,"sourceEndSec":45,"narrationMy":"..."}]}',
     (MOMENT_CUT
@@ -1016,7 +1062,7 @@ async function generateScriptChunk({ sceneSummaries, lengthMinutes, category, fi
     '- ONE SENTENCE = ONE BEAT. Never narrate a story point whose footage is not inside this scene\'s window — SKIP it instead of describing it over other footage. If the narrated action has no footage (a decision, a phone call), narrate it over the footage of the event it causes, and only if that footage is inside the window.',
     '- "title": a one-sentence spoiler premise in the channels\' style — "when [shocking thing] happened, then [twist]" — ending in …တဲ့အခါ / …တဲ့အချိန်မှာ / …တော့.',
     '- "narrationMy": pure SPOKEN Burmese. Rules, in order of importance:',
-    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the CASUAL SPOKEN register, like a friend telling the story. Endings vary the way speech varies — most statements end in တယ် (ဖြစ်တယ်, ပြောတယ်, လုပ်လိုက်တယ်), but let sentences flow into each other with ပြီး/တော့/ကြောင့် and use different closing verbs; NEVER stamp the same ending on every sentence (ending every sentence in တယ် sounds robotic). NEVER write ပါတယ် or ပါတော့တယ် — ပါတယ် is the formal newsreader register and does NOT fit spoken narration; it makes the voice sound stiff and written, not like a person talking.',
+    '  1. ZERO literary forms — never write သည်, များ, ၏, ၌, သောအခါက. Use တယ်, တွေ, ရဲ့ (or drop it), မှာ, တုံးက. AND ZERO ဗျာ / ဗျ / ခင်ဗျာ — the narrator never speaks politely to an elder. ဗျာ makes the voice sound like an old man (ဘိုးတော်) and is FORBIDDEN. Narrate in the CASUAL SPOKEN register, like a friend telling the story. Endings vary the way speech varies — let sentences flow into each other with ပြီး/တော့/ကြောင့် and use different closing verbs; NEVER stamp the same ending on every sentence (ending every sentence in တယ် sounds robotic — job da2908ab came back 50/50 တယ် despite this rule, because the old wording also said most statements end in တယ်; that clause is removed, do not default to တယ်). NEVER write ပါတယ် or ပါတော့တယ် — ပါတယ် is the formal newsreader register and does NOT fit spoken narration; it makes the voice sound stiff and written, not like a person talking.',
     '  2. LONG DENSE sentences — 4-7 events per sentence, chained with ပြီး/တော့/ကြောင့်/အဲ့ဒါကြောင့်/အဲ့လိုနဲ့/နောက်ဆုံး, like the real example above. A recap is a STORY: character + situation, cause and effect, what happens next — NEVER short one-event clauses, NEVER a list of pictures. If a scene needs 10 seconds of narration, chain MORE moments into the sentence — do NOT split it into short sentences.',
     '  3. Open scene 1 cold, straight into the story — no greeting, no channel intro, no hook question. Start with the premise and run.',
     '  4. NEVER address the viewer directly — no နော် / ပါဦး / လေး to the viewer, no questions to the viewer, no "keep watching" lines. Just tell the story.',
@@ -1183,6 +1229,10 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
   const chunks = splitBeatsIntoChunks(sceneSummaries);
   let title = 'မြန်မာ Recap';
   const allScenes = [];
+  let priorNarration = ''; // tail of the previous chunk, so later chunks
+  // reuse the SAME Burmese name spellings (chunk boundary renamed the
+  // hero at scene 43 in job da2908ab). Chunks run sequentially, so this
+  // costs no extra Gemini call.
   for (let c = 0; c < chunks.length; c++) {
     const part = await generateScriptChunk({
       sceneSummaries: chunks[c],
@@ -1192,11 +1242,14 @@ async function generateScript({ sceneSummaries, lengthMinutes, category, fileNam
       targetSecPerScene,
       chunkIndex: c,
       totalChunks: chunks.length,
+      priorNarration,
     });
     if (c === 0 && part.title) title = part.title;
     for (const s of part.scenes) {
       allScenes.push({ ...s, sceneNumber: allScenes.length + 1 });
     }
+    const lastNarration = (part.scenes[part.scenes.length - 1] || {}).narrationMy || '';
+    if (lastNarration) priorNarration = lastNarration.slice(-800);
   }
   return { title, scenes: allScenes };
 }

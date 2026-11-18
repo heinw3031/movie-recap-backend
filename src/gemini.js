@@ -562,6 +562,160 @@ async function verifyMomentGroupWithModel(ai, group) {
 }
 
 /**
+ * Ask Gemini (vision, ANALYSIS_MODEL) to caption one group of shot
+ * frames. `group` is [{ index, startSec, endSec, midSec, framePath }] —
+ * one inline image per shot, each followed by its id, so the model can
+ * attribute every caption to the right frame. Returns the captions
+ * array (possibly empty on a bad response — the caller treats missing
+ * captions as uncaptioned). One call per group, never one call per shot.
+ * Captions are one short factual clause in English, literally what is
+ * visible — the same discipline as a verification verdict's `actual`.
+ */
+async function captionShotGroupWithModel(ai, group) {
+  const parts = [];
+  for (const s of group) {
+    parts.push({
+      inlineData: {
+        mimeType: 'image/jpeg',
+        data: fs.readFileSync(s.framePath).toString('base64'),
+      },
+    });
+    parts.push({ text: `Shot ${s.index} @${s.midSec.toFixed(1)}s` });
+  }
+  parts.push({
+    text: [
+      'These are real frames from one video, each followed by a shot id.',
+      'For EACH shot, look at its frame and write ONE short factual clause in English describing literally what is visible: people, objects, place, action. No interpretation, no story, no guessing beyond the frame.',
+      'Return JSON only, no markdown, in this exact shape:',
+      '{"captions":[{"id":0,"caption":"a man in a red jacket walking on a bridge at night"},{"id":1,"caption":"a robot hand touching a boy\'s face in a laboratory"}]}',
+      'Rules:',
+      '- One caption per shot id, in the same order as the shots above. Do not add shots, do not drop any.',
+      '- If a frame is blank, black, or unclear, caption it "blank frame" or "unclear frame" — never invent what is not visible.',
+      '- Keep each caption under 20 words.',
+    ].join('\n'),
+  });
+  // Same retry posture as moment verification (maxRetries 3): a
+  // transient 503 must not kill captioning for the whole job.
+  const response = await withRetry(
+    () =>
+      ai.models.generateContent({
+        model: ANALYSIS_MODEL,
+        contents: [{ parts }],
+        config: { responseMimeType: 'application/json' },
+      }),
+    'shot captioning',
+    { maxRetries: 3 }
+  );
+  const text = response.text;
+  if (!text) return [];
+  const parsed = parseJsonResponse(text, 'shot captioning');
+  if (Array.isArray(parsed.captions)) return parsed.captions;
+  if (Array.isArray(parsed.results)) return parsed.results;
+  return [];
+}
+
+/**
+ * Caption shot frames with Gemini (the free VLM) — movie-narrator step
+ * 9's VLM captioner, replaced by the verifyMoments machinery we already
+ * have: extract one frame per shot midpoint, one generateContent call
+ * per <= maxPerCall frames.
+ *
+ * shots: [{ index, startSec, endSec, midSec, durationSec }] (from
+ * shots.detectShots, already sampled down by the caller).
+ * Returns { shots, stats } where shots carry a `caption` field ('' when
+ * a shot got no caption) and stats is
+ * { shots, captioned, calls, enabled, status } with status 'captioned'
+ * | 'skipped' | 'failed'. On ANY failure the ORIGINAL shots are
+ * returned with empty captions and status 'failed' — captioning never
+ * fails the job; the matcher then falls back to heuristic anchors.
+ * Quota: ceil(shots / maxPerCall) calls, logged so the cost is visible
+ * (3.8-flash is 20/day per project).
+ *
+ * opts (all optional, for tests):
+ *  - enabled: default SHOT_MATCH_ENABLED (SHOT_MATCH env).
+ *  - maxPerCall: default 40 (same batch as verification).
+ *  - frameProvider(videoPath, atSec, outPath): default
+ *    extractMomentFrame. Tests inject a stub.
+ *  - modelFn(group): default the real Gemini call. Tests inject a mock.
+ *    The group passed to modelFn is
+ *    [{ index, startSec, endSec, midSec, framePath }].
+ */
+const SHOT_CAPTION_MAX_PER_CALL = 40;
+async function captionShotFrames(shots, videoPath, workDir, opts = {}) {
+  const enabled = opts.enabled !== undefined ? opts.enabled : process.env.SHOT_MATCH !== '0';
+  const maxPerCall = opts.maxPerCall || SHOT_CAPTION_MAX_PER_CALL;
+  const frameProvider = opts.frameProvider || extractMomentFrame;
+  const modelFn = opts.modelFn || null;
+  const baseStats = { shots: 0, captioned: 0, calls: 0, enabled, status: 'skipped' };
+  const plain = (Array.isArray(shots) ? shots : []).map((s) => ({ ...s, caption: '' }));
+  if (!enabled) return { shots: plain, stats: baseStats };
+  if (plain.length === 0) return { shots: plain, stats: baseStats };
+  baseStats.shots = plain.length;
+
+  const frameDir = workDir;
+  let calls = 0;
+  let failedGroups = 0;
+  const byIndex = new Map();
+  try {
+    fs.mkdirSync(frameDir, { recursive: true });
+    const groups = [];
+    for (let i = 0; i < plain.length; i += maxPerCall) groups.push(plain.slice(i, i + maxPerCall));
+    for (let gi = 0; gi < groups.length; gi++) {
+      const group = groups[gi];
+      const withFrames = [];
+      for (const s of group) {
+        const outPath = path.join(frameDir, `shot${s.index}.jpg`);
+        try {
+          await frameProvider(videoPath, s.midSec, outPath);
+          withFrames.push({ ...s, framePath: outPath });
+        } catch (e) {
+          console.log(`[caption] frame extraction failed for shot ${s.index} @${s.midSec.toFixed(1)}s (${String(e.message).slice(0, 100)}) — leaving it uncaptioned`);
+        }
+      }
+      if (withFrames.length === 0) {
+        failedGroups++;
+        continue;
+      }
+      try {
+        calls++;
+        let captions;
+        if (modelFn) {
+          captions = await modelFn(withFrames);
+        } else {
+          captions = await captionShotGroupWithModel(getClient(), withFrames);
+        }
+        for (const c of Array.isArray(captions) ? captions : []) {
+          const idx = Number(c && c.index);
+          if (!Number.isFinite(idx) || byIndex.has(idx)) continue;
+          const text = String((c && c.caption) || '').trim();
+          if (text) byIndex.set(idx, text);
+        }
+      } catch (e) {
+        failedGroups++;
+        console.log(`[caption] group ${gi + 1}/${groups.length} failed (${String(e.message).slice(0, 120)}) — leaving its ${withFrames.length} shot(s) uncaptioned`);
+      }
+    }
+    const captionedShots = plain.map((s) => ({ ...s, caption: byIndex.get(s.index) || '' }));
+    const captioned = captionedShots.filter((s) => s.caption).length;
+    const stats = {
+      ...baseStats,
+      captioned,
+      calls,
+      status: failedGroups === groups.length && groups.length > 0 ? 'failed' : 'captioned',
+    };
+    console.log(`[caption] ${captioned}/${plain.length} shots captioned in ${calls} Gemini call(s), status ${stats.status}`);
+    return { shots: captionedShots, stats };
+  } catch (err) {
+    console.log(`[caption] captioning failed (${String(err.message).slice(0, 160)}) — continuing with uncaptioned shots`);
+    return { shots: plain, stats: { ...baseStats, status: 'failed' } };
+  } finally {
+    try {
+      fs.rmSync(frameDir, { recursive: true, force: true });
+    } catch (_) {}
+  }
+}
+
+/**
  * Apply verification verdicts to a set of beats (pure — no I/O, testable).
  * `moments` is the flat list [{ id, beatIndex, momentIndex, atSec, what }]
  * built by verifyMoments; `verdicts` is the model's verdict array.
@@ -1634,6 +1788,8 @@ module.exports = {
   analyzeVideoAuto,
   verifyMoments,
   applyVerdicts,
+  captionShotFrames,
+  SHOT_CAPTION_MAX_PER_CALL,
   generateScript,
   generateScriptChunk,
   splitBeatsIntoChunks,

@@ -16,6 +16,7 @@ const store = require('./store');
 const gemini = require('./gemini');
 const edgeTts = require('./edgeTts');
 const render = require('./render');
+const shots = require('./shots');
 
 function setStage(jobId, status, progress, extra = {}) {
   return store.updateJob(jobId, { status, progress, ...extra });
@@ -169,6 +170,37 @@ async function runGenerate(jobId) {
       setStage(jobId, 'tts', 70);
     }
 
+    // --- Shot matching (2026-11-18, movie-narrator step 9) ---
+    // Replace the LLM-guessed scene windows with windows cut on REAL
+    // shot boundaries, semantically matched to the narration via Gemini
+    // captions (see src/shots.js). Runs on the APPROVED scenes (the
+    // user may have edited the script) after TTS, before render, so the
+    // audio durations are known for the duration-fit term. Any failure
+    // returns null and the LLM windows are kept — matching never fails
+    // the job. SHOT_MATCH=0 disables it without a redeploy.
+    let matchSummary = null;
+    try {
+      const matched = await shots.matchScenesToShots({
+        sourceVideo: job.sourcePath,
+        scenes: scenesWithAudio,
+        sceneSummaries: job.sceneSummaries || null,
+        workDir: path.join(dir, 'shots'),
+        jobId,
+      });
+      if (matched) {
+        scenesWithAudio = matched.scenes;
+        matchSummary = matched.summary;
+      } else {
+        console.log(`[job ${jobId}] shot match skipped or failed — keeping LLM windows`);
+      }
+    } catch (err) {
+      console.log(`[job ${jobId}] shot match failed (${String(err.message).slice(0, 160)}) — keeping LLM windows`);
+    }
+    store.updateJob(jobId, {
+      scenes: scenesWithAudio,
+      ...(matchSummary ? { matchSummary } : {}),
+    });
+
     // --- Render ---
     setStage(jobId, 'rendering', 75);
     const out720 = path.join(dir, 'final_720p.mp4');
@@ -191,6 +223,7 @@ async function runGenerate(jobId) {
 
     const done = setStage(jobId, 'done', 100, {
       scenes: scenesWithAudio,
+      ...(matchSummary ? { matchSummary } : {}),
       finalVideoUrl: `/api/jobs/${jobId}/video`,
       finalVideo720p: 'final_720p.mp4',
       finalVideo480p: 'final_480p.mp4',

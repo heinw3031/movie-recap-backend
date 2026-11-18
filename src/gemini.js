@@ -49,7 +49,7 @@ function isRetryableError(err) {
   if (isDailyQuotaError(err)) return false;
   const msg = String((err && err.message) || '');
   return (
-    /429|503|UNAVAILABLE|RESOURCE_EXHAUSTED|fetch failed|ECONNRESET|ETIMEDOUT/i.test(msg)
+    /429|503|UNAVAILABLE|RESOURCE_EXHAUSTED|fetch failed|ECONNRESET|ETIMEDOUT|timed out after/i.test(msg)
   );
 }
 
@@ -73,6 +73,44 @@ async function withRetry(fn, what, opts = {}) {
     }
   }
   throw lastErr;
+}
+
+// 2026-11-18: analysis timeout (job a793e1ec, 2026-11-17 ~22:27). The
+// retest sat at 'analysing', progress 10, for ~110 minutes with no
+// progress, no scenes and no error, and was stopped with no video. The
+// Files API / frames generateContent call has NO timeout, so a hung
+// network connection blocks forever — it neither returns nor throws, so
+// withRetry never gets a chance to retry and analyzeVideoAuto never gets
+// a chance to fall back to frame analysis. A successful analysis of a
+// 12-min video takes minutes, so 15 min per attempt is a generous bound:
+// a hung call now fails fast with a clear "timed out" error, is retried
+// (a timeout IS retryable — see isRetryableError), and the Files path
+// falls back to frames. Retries are capped at 2 for analysis (3 attempts
+// x 15 min = 45 min worst case) instead of the default 5, so a
+// persistently hung endpoint cannot stall a job for 90 minutes.
+// Override with ANALYSIS_TIMEOUT_MS (milliseconds). NOTE: the timeout
+// only unblocks the pipeline — the SDK gives no way to cancel the
+// underlying request, so a hung call may still finish in the background;
+// its result is discarded.
+const ANALYSIS_TIMEOUT_MS = Math.max(
+  60000,
+  parseInt(process.env.ANALYSIS_TIMEOUT_MS || '900000', 10) || 900000
+);
+
+function withTimeout(promise, ms, what) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `${what} timed out after ${Math.round(ms / 1000)}s with no response — the connection appears hung, not quota or overload`
+          )
+        ),
+      ms
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Free-tier TTS quota is 3 requests/minute per model. Space TTS calls
@@ -287,13 +325,23 @@ async function analyzeVideo(videoPath, framesDir, firstNonBlackSec = null) {
     ].join('\n'),
   });
 
+  // 2026-11-18: withTimeout — a hung generateContent call used to block
+  // forever (job a793e1ec: 110 min at 'analysing', progress 10). The
+  // timeout is per attempt and retries are capped at 2, so the worst case
+  // is 3 x 15 min, then the job fails with a clear error instead of
+  // hanging silently.
   const response = await withRetry(
     () =>
-      ai.models.generateContent({
-        model: ANALYSIS_MODEL,
-        contents: [{ parts }],
-      }),
-    'video analysis'
+      withTimeout(
+        ai.models.generateContent({
+          model: ANALYSIS_MODEL,
+          contents: [{ parts }],
+        }),
+        ANALYSIS_TIMEOUT_MS,
+        'video analysis'
+      ),
+    'video analysis',
+    { maxRetries: 2 }
   );
   const text = response.text;
   if (!text) throw new Error('Gemini analysis returned no text.');
@@ -358,17 +406,21 @@ async function analyzeVideoWithFiles(videoPath, firstNonBlackSec = null) {
   );
   try {
     await waitForFileActive(ai, file.name);
+    // 2026-11-18: withTimeout — same hang as the frames path (job
+    // a793e1ec). Per-attempt timeout, retries capped at 2; on final
+    // failure analyzeVideoAuto falls back to frame analysis.
     const response = await withRetry(
       () =>
-        ai.models.generateContent({
-          model: ANALYSIS_MODEL,
-          contents: [
-            {
-              parts: [
-                { fileData: { mimeType, fileUri: file.uri } },
-                {
-                  text: [
-                    'Watch AND listen to this video (picture and sound/dialogue).',
+        withTimeout(
+          ai.models.generateContent({
+            model: ANALYSIS_MODEL,
+            contents: [
+              {
+                parts: [
+                  { fileData: { mimeType, fileUri: file.uri } },
+                  {
+                    text: [
+                      'Watch AND listen to this video (picture and sound/dialogue).',
                     'Do NOT invent a plot from the filename. Describe only what you can see and hear.',
                     'Describe ONLY what is literally visible and audible — what people and robots actually DO, in plain words. Never invent motion, weather, lighting or an action that is not on screen: a robot standing still is NOT "powering up", a bright room is NOT "a smoggy dawn skyline".',
                     'Return JSON only, no markdown, in this exact shape:',
@@ -384,8 +436,12 @@ async function analyzeVideoWithFiles(videoPath, firstNonBlackSec = null) {
               ],
             },
           ],
-        }),
-      'video analysis (Files API)'
+          }),
+          ANALYSIS_TIMEOUT_MS,
+          'video analysis (Files API)'
+        ),
+      'video analysis (Files API)',
+      { maxRetries: 2 }
     );
     const text = response.text;
     if (!text) throw new Error('Gemini Files API analysis returned no text.');
@@ -1505,6 +1561,9 @@ async function generateRecapAudio(scenes, audioDir, voiceName = DEFAULT_TTS_VOIC
 
 module.exports = {
   ANALYSIS_MODEL,
+  ANALYSIS_TIMEOUT_MS,
+  withTimeout,
+  isRetryableError,
   MOMENT_CUT,
   VERIFY_MOMENTS,
   MOMENTS_PER_VERIFY_CALL,

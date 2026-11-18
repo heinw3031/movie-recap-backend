@@ -46,6 +46,10 @@ function publicJob(job) {
     momentsCorrected: job.momentsCorrected ?? null,
     momentsDropped: job.momentsDropped ?? null,
     momentsVerification: job.momentsVerification || null,
+    // Shot matching (2026-11-18, movie-narrator step 9): match_summary
+    // with degraded_reason — null when matching was skipped/failed and
+    // the LLM windows were kept.
+    matchSummary: job.matchSummary || null,
     sourceDurationSec: job.sourceDurationSec ?? null,
     audioDurations: job.audioDurations || {},
     finalVideoUrl: job.finalVideoUrl || null,

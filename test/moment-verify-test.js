@@ -318,6 +318,45 @@ async function main() {
   check('correction just past the beat end is clamped into the beat (42s)', av.beats[0].moments[0].atSec === 42, JSON.stringify(av.beats[0].moments));
   check('clamp counts as corrected', av.stats.corrected === 1 && av.stats.dropped === 0, JSON.stringify(av.stats));
 
+  console.log('--- 12. description grounding (job da2908ab root cause) ---');
+  // Verification used to rebuild ONLY the moments — the beat description
+  // was untouched, and the script is written from the description, so
+  // dropping 91/100 moments still left the narration wrong. A touched
+  // beat's description must now come from verified evidence only.
+  const av12 = applyVerdicts(
+    [
+      { startSec: 50, endSec: 65, description: 'Thom examines a brain on a plate, then walks the workshop floor', moments: [
+        { atSec: 52, what: 'brain on a plate' },
+        { atSec: 60, what: 'Thom walks the workshop floor [WRONG]' },
+      ] },
+      { startSec: 65, endSec: 80, description: 'bridge walk', moments: [
+        { atSec: 70, what: 'couple walks on the bridge' },
+      ] },
+    ],
+    [
+      { id: 0, beatIndex: 0, momentIndex: 0, atSec: 52, what: 'brain on a plate' },
+      { id: 1, beatIndex: 0, momentIndex: 1, atSec: 60, what: 'Thom walks the workshop floor [WRONG]' },
+      { id: 2, beatIndex: 1, momentIndex: 0, atSec: 70, what: 'couple walks on the bridge' },
+    ],
+    [
+      { id: 0, confirmed: true },
+      { id: 1, confirmed: false, actual: 'a sniper aiming a rifle', correctedAtSec: null },
+      { id: 2, confirmed: true },
+    ]
+  );
+  check('touched beat: wrong moment dropped', av12.beats[0].moments.length === 1 && av12.beats[0].moments[0].what === 'brain on a plate', JSON.stringify(av12.beats[0].moments));
+  check('touched beat: description rebuilt from verified evidence, not the wrong claim', av12.beats[0].description.includes('brain on a plate') && av12.beats[0].description.includes('a sniper aiming a rifle') && !av12.beats[0].description.includes('walks the workshop floor'), av12.beats[0].description);
+  check('untouched beat: description kept exactly', av12.beats[1].description === 'bridge walk', av12.beats[1].description);
+  check('stats: 1 description rewritten', av12.stats.descriptionsRewritten === 1, JSON.stringify(av12.stats));
+  // Beat with no verified evidence at all: original kept, driftRisk flagged.
+  const av12b = applyVerdicts(
+    [{ startSec: 0, endSec: 12, description: 'unverifiable claim', moments: [{ atSec: 5, what: 'something [WRONG]' }] }],
+    [{ id: 0, beatIndex: 0, momentIndex: 0, atSec: 5, what: 'something [WRONG]' }],
+    [{ id: 0, confirmed: false, actual: '', correctedAtSec: null }]
+  );
+  check('no evidence: description kept, driftRisk flagged', av12b.beats[0].description === 'unverifiable claim' && av12b.beats[0].driftRisk === true, JSON.stringify(av12b.beats[0]));
+  check('stats: 1 beat ungrounded', av12b.stats.beatsUngrounded === 1, JSON.stringify(av12b.stats));
+
   if (failed > 0) throw new Error(`${failed} assertion(s) failed, ${passed} passed.`);
   console.log(`MOMENT-VERIFY TEST PASSED: ${passed} assertions, 0 failed.`);
 }

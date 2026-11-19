@@ -685,7 +685,13 @@ async function captionShotFrames(shots, videoPath, workDir, opts = {}) {
           captions = await captionShotGroupWithModel(getClient(), withFrames);
         }
         for (const c of Array.isArray(captions) ? captions : []) {
-          const idx = Number(c && c.index);
+          // BUG FIX 2026-11-19: the prompt asks Gemini for {"id":N,"caption":...}
+          // but this used to read c.index — always NaN, so EVERY real
+          // caption was silently discarded (retest 2026-11-19: 0/107
+          // captioned, all 32 scenes heuristic). Accept `id` (real
+          // Gemini shape, same as verifyMoments verdicts) and fall back
+          // to `index` for older stubs.
+          const idx = Number(c && (c.id !== undefined ? c.id : c.index));
           if (!Number.isFinite(idx) || byIndex.has(idx)) continue;
           const text = String((c && c.caption) || '').trim();
           if (text) byIndex.set(idx, text);
@@ -701,7 +707,10 @@ async function captionShotFrames(shots, videoPath, workDir, opts = {}) {
       ...baseStats,
       captioned,
       calls,
-      status: failedGroups === groups.length && groups.length > 0 ? 'failed' : 'captioned',
+      // 0 captioned despite successful calls is a failure, not a success:
+      // before this fix the log said "0/107 captioned, status captioned",
+      // hiding that every caption had been discarded.
+      status: (failedGroups === groups.length && groups.length > 0) || captioned === 0 ? 'failed' : 'captioned',
     };
     console.log(`[caption] ${captioned}/${plain.length} shots captioned in ${calls} Gemini call(s), status ${stats.status}`);
     return { shots: captionedShots, stats };

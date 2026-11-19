@@ -259,7 +259,10 @@ async function main() {
   let modelCalls = 0;
   const mockCaption = async (group) => {
     modelCalls++;
-    return group.map((s) => ({ index: s.index, caption: `shot ${s.index} shows a test frame` }));
+    // Real Gemini shape per the caption prompt: {id, caption} — NOT
+    // {index, caption}. A stub returning `index` masked the 2026-11-19
+    // live bug where every real caption was discarded (0/107).
+    return group.map((s) => ({ id: s.index, caption: `shot ${s.index} shows a test frame` }));
   };
   const eighty = makeShots(80, null);
   const cap10 = await captionShotFrames(eighty, SOURCE_PATH, path.join(TEST_DIR, 'c10'), {
@@ -269,7 +272,14 @@ async function main() {
   check('all 80 shots captioned', cap10.stats.captioned === 80, JSON.stringify(cap10.stats));
   check('captions attach to the right shot by id', cap10.shots[37].caption === 'shot 37 shows a test frame', cap10.shots[37].caption);
   check('captioning status is captioned', cap10.stats.status === 'captioned', JSON.stringify(cap10.stats));
-  const partialMock = async (group) => group.slice(0, 1).map((s) => ({ index: s.index, caption: 'only the first' }));
+  // Regression (live bug 2026-11-19): a model returning captions with NO
+  // usable id at all must report status failed, not "captioned" with 0.
+  const emptyMock = async (group) => group.map(() => ({ caption: 'no id here' }));
+  const cap10e = await captionShotFrames(makeShots(3, null), SOURCE_PATH, path.join(TEST_DIR, 'c10e'), {
+    modelFn: emptyMock, frameProvider: stubFrame,
+  });
+  check('captions with no id attach to nothing and status is failed', cap10e.stats.captioned === 0 && cap10e.stats.status === 'failed', JSON.stringify(cap10e.stats));
+  const partialMock = async (group) => group.slice(0, 1).map((s) => ({ id: s.index, caption: 'only the first' }));
   const cap10b = await captionShotFrames(makeShots(3, null), SOURCE_PATH, path.join(TEST_DIR, 'c10b'), {
     modelFn: partialMock, frameProvider: stubFrame,
   });

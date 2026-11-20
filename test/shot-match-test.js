@@ -29,7 +29,10 @@
  * 11. Shot captioning (stubbed model): 80 shots cost <= 2 model calls
  *     (40 per call), captions attach by id, a missing caption is ''
  *     (not a crash), and a throwing model returns status 'failed'
- *     with the original shots — captioning never throws.
+ *     with the original shots — captioning never throws. A model
+ *     restarting ids at 0 for every group still captions all shots
+ *     (position fallback), and a caption with no id at all attaches
+ *     to nothing with status 'failed'.
  * 12. matchScenesToShots (stubbed detect + caption): scenes get
  *     refined windows + summary; a throwing caption step returns null
  *     (pipeline keeps LLM windows); disabled returns null.
@@ -272,6 +275,17 @@ async function main() {
   check('all 80 shots captioned', cap10.stats.captioned === 80, JSON.stringify(cap10.stats));
   check('captions attach to the right shot by id', cap10.shots[37].caption === 'shot 37 shows a test frame', cap10.shots[37].caption);
   check('captioning status is captioned', cap10.stats.status === 'captioned', JSON.stringify(cap10.stats));
+  // Regression (live bug 2026-11-20): Gemini restarts caption ids at 0
+  // for EVERY group (the prompt example showed id 0, id 1), so groups
+  // 2-3 returned ids 0-39 that collided with group 1 and were dropped
+  // — only 40/107 shots captioned live. Position fallback must rescue
+  // them, because captions come back in shot order.
+  const groupRelativeMock = async (group) => group.map((s, i) => ({ id: i, caption: `shot ${s.index} shows a test frame` }));
+  const cap10f = await captionShotFrames(eighty, SOURCE_PATH, path.join(TEST_DIR, 'c10f'), {
+    modelFn: groupRelativeMock, frameProvider: stubFrame,
+  });
+  check('group-relative ids (0-39 every group) still caption all 80 shots', cap10f.stats.captioned === 80, JSON.stringify(cap10f.stats));
+  check('group-relative ids attach to the right shots by position', cap10f.shots[37].caption === 'shot 37 shows a test frame' && cap10f.shots[77].caption === 'shot 77 shows a test frame', `${cap10f.shots[37].caption} | ${cap10f.shots[77].caption}`);
   // Regression (live bug 2026-11-19): a model returning captions with NO
   // usable id at all must report status failed, not "captioned" with 0.
   const emptyMock = async (group) => group.map(() => ({ caption: 'no id here' }));

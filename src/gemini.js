@@ -582,14 +582,22 @@ async function captionShotGroupWithModel(ai, group) {
     });
     parts.push({ text: `Shot ${s.index} @${s.midSec.toFixed(1)}s` });
   }
+  // The example must show this group's REAL shot ids, not 0 and 1:
+  // Gemini copies the example's ids, so a static {"id":0},{"id":1}
+  // example made it restart ids at 0 for every group (live bug
+  // 2026-11-20: groups 2-3 returned 0-39 and were dropped as
+  // duplicates of group 1 — only 40/107 shots captioned).
+  const firstId = group.length > 0 ? group[0].index : 0;
+  const secondId = group.length > 1 ? group[1].index : firstId + 1;
   parts.push({
     text: [
       'These are real frames from one video, each followed by a shot id.',
       'For EACH shot, look at its frame and write ONE short factual clause in English describing literally what is visible: people, objects, place, action. No interpretation, no story, no guessing beyond the frame.',
       'Return JSON only, no markdown, in this exact shape:',
-      '{"captions":[{"id":0,"caption":"a man in a red jacket walking on a bridge at night"},{"id":1,"caption":"a robot hand touching a boy\'s face in a laboratory"}]}',
+      `{"captions":[{"id":${firstId},"caption":"a man in a red jacket walking on a bridge at night"},{"id":${secondId},"caption":"a robot hand touching a boy's face in a laboratory"}]}`,
       'Rules:',
       '- One caption per shot id, in the same order as the shots above. Do not add shots, do not drop any.',
+      '- Use the EXACT shot ids shown above each frame — do not restart ids at 0.',
       '- If a frame is blank, black, or unclear, caption it "blank frame" or "unclear frame" — never invent what is not visible.',
       '- Keep each caption under 20 words.',
     ].join('\n'),
@@ -684,17 +692,28 @@ async function captionShotFrames(shots, videoPath, workDir, opts = {}) {
         } else {
           captions = await captionShotGroupWithModel(getClient(), withFrames);
         }
-        for (const c of Array.isArray(captions) ? captions : []) {
-          // BUG FIX 2026-11-19: the prompt asks Gemini for {"id":N,"caption":...}
-          // but this used to read c.index — always NaN, so EVERY real
-          // caption was silently discarded (retest 2026-11-19: 0/107
-          // captioned, all 32 scenes heuristic). Accept `id` (real
-          // Gemini shape, same as verifyMoments verdicts) and fall back
-          // to `index` for older stubs.
-          const idx = Number(c && (c.id !== undefined ? c.id : c.index));
-          if (!Number.isFinite(idx) || byIndex.has(idx)) continue;
+        // Caption ids are unreliable: Gemini may return the GLOBAL shot
+        // ids (40-79 for group 2) or restart ids at 0 for every group
+        // (live bug 2026-11-20: groups 2-3 returned 0-39, colliding
+        // with group 1, so only 40/107 shots were captioned). Match by
+        // id when it names a shot in THIS group; otherwise fall back to
+        // array position — the prompt guarantees captions come back in
+        // the same order as the shots. A caption with NO numeric id at
+        // all is still discarded (2026-11-19 regression).
+        const validIds = new Set(group.map((s) => s.index));
+        const list = Array.isArray(captions) ? captions : [];
+        for (let i = 0; i < list.length; i++) {
+          const c = list[i];
           const text = String((c && c.caption) || '').trim();
-          if (text) byIndex.set(idx, text);
+          if (!text) continue;
+          const rawId = c && (c.id !== undefined ? c.id : c.index);
+          const idx = Number(rawId);
+          if (Number.isFinite(idx) && validIds.has(idx) && !byIndex.has(idx)) {
+            byIndex.set(idx, text);
+          } else if (Number.isFinite(idx)) {
+            const shot = group[i];
+            if (shot && !byIndex.has(shot.index)) byIndex.set(shot.index, text);
+          }
         }
       } catch (e) {
         failedGroups++;
